@@ -1,7 +1,16 @@
 .{
     .name = "zig-gltf",
     .version = "0.0.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zgl = .{
+            .url = "https://github.com/ziglibs/zgl/archive/f170f34d1ed7a00aa6a2a00aafba40b661896010.tar.gz",
+            .hash = "12204115129438285a43d0a853d4d4bb86a63ab82b140189a47bc987f7b08d2252b0",
+        },
+        .sdl = .{
+            .url = "https://github.com/ikskuh/SDL.zig/archive/38ca4efa99d05431902021df0997f804a6c6d4f3.tar.gz",
+            .hash = "1220dc7b8b63eab7a4184fde897e51f8f1301d8615a0bbb0c9f8f0b693fa38055c4e",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
