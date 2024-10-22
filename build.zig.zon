@@ -10,6 +10,14 @@
             .url = "https://github.com/ikskuh/SDL.zig/archive/38ca4efa99d05431902021df0997f804a6c6d4f3.tar.gz",
             .hash = "1220dc7b8b63eab7a4184fde897e51f8f1301d8615a0bbb0c9f8f0b693fa38055c4e",
         },
+        .zgltf = .{
+            .url = "https://github.com/kooparse/zgltf/archive/b8a821d5fc6d1cd2913cead6cc149f94cfbc92ae.tar.gz",
+            .hash = "1220ebbbf8f55960a27c4d0543463b26662b12d5d9d801abf2eba665859b9bfdbd15",
+        },
+        .ZigUtils = .{
+            .url = "https://github.com/noxabellus/zig-utils/archive/3ec4c3b2dc52296a9fa5bb6affee9e8b4234934d.tar.gz",
+            .hash = "122070d458e27f61f7ddea56db454878633eb3d50180b6b1dcf210ff4e92106cb4ca",
+        },
     },
     .paths = .{
         "build.zig",

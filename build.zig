@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zgltf = b.dependency("zgltf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const zigUtils = b.dependency("ZigUtils", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sdlSdk = sdl.init(b, .{});
 
     const exe = b.addExecutable(.{
@@ -20,6 +30,8 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("zgl", zgl.module("zgl"));
+    exe.root_module.addImport("zgltf", zgltf.module("zgltf"));
+    exe.root_module.addImport("ZigUtils", zigUtils.module("ZigUtils"));
 
     sdlSdk.link(exe, .dynamic, sdl.Library.SDL2);
 
@@ -32,6 +44,8 @@ pub fn build(b: *std.Build) void {
     });
 
     testExe.root_module.addImport("zgl", zgl.module("zgl"));
+    testExe.root_module.addImport("zgltf", zgltf.module("zgltf"));
+    testExe.root_module.addImport("ZigUtils", zigUtils.module("ZigUtils"));
 
     sdlSdk.link(testExe, .dynamic, sdl.Library.SDL2);
 
