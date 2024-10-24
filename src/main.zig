@@ -110,11 +110,16 @@ pub fn main() !void {
         bufferMap[i] = bin;
     }
 
-    const Vertex = struct {
-        pos: struct { f32, f32, f32 },
-        normal: struct { f32, f32, f32 },
-        joints: struct { u16, u16, u16, u16 },
-        weights: struct { f32, f32, f32, f32 },
+    const Vertex = extern struct {
+        pos: Pos,
+        normal: Normal,
+        joints: Joints,
+        weights: Weights,
+
+        pub const Pos = [3]f32;
+        pub const Normal = [3]f32;
+        pub const Joints = [4]u16;
+        pub const Weights = [4]f32;
     };
 
     var vertices = std.ArrayList(Vertex).init(allocator);
@@ -273,39 +278,43 @@ pub fn main() !void {
 
     shaderProgram.use();
 
-    const matrixLocation = shaderProgram.uniformLocation("modelToClip") orelse return error.MissingUniform;
 
 
     const vao = zgl.createVertexArray();
     vao.bind();
 
     const vbo = zgl.createBuffer();
-    vbo.bind(.array_buffer);
+    vao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex));
     vbo.data(Vertex, vertices.items, .static_draw);
 
     const ebo = zgl.createBuffer();
-    ebo.bind(.element_array_buffer);
+    vao.elementBuffer(ebo);
     ebo.data(u16, indices.items, .static_draw);
 
-    // // position attribute
-    // glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    // glEnableVertexAttribArray(0);
-    // // normal attribute
-    // glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3* sizeof(float)));
-    // glEnableVertexAttribArray(1);
+    // position attribute
+    vao.attribFormat(0, 3, .float, true, 0);
+    vao.attribBinding(0, 0);
+    vao.enableVertexAttribute(0);
+
+    // normal attribute
+    vao.attribFormat(1, 3, .float, true, @offsetOf(Vertex, "normal"));
+    vao.attribBinding(1, 0);
+    vao.enableVertexAttribute(1);
 
 
-    const modelToWorld = zmath.rotationY(0);
+    const modelToWorld = zmath.identity();
     const worldToView = zmath.lookAtRh(
-        zmath.f32x4(3.0, 3.0, 3.0, 1.0), // eye position
-        zmath.f32x4(0.0, 0.0, 0.0, 1.0), // focus point
-        zmath.f32x4(0.0, 1.0, 0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
+        zmath.f32x4(0.0, 0.25, 3.0, 1.0), // eye position
+        zmath.f32x4(0.0, 0.25, 0.0, 1.0), // focus point
+        zmath.f32x4(1.0, 0.0, 0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
     );
 
     const viewToClip = zmath.perspectiveFovRhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0);
 
     const modelToView = zmath.mul(modelToWorld, worldToView);
     const modelToClip = zmath.mul(modelToView, viewToClip);
+
+    const matrixLocation = shaderProgram.uniformLocation("modelToClip") orelse return error.MissingUniform;
 
     // Transposition is needed because GLSL uses column-major matrices by default
     shaderProgram.uniformMatrix4(matrixLocation, true, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&modelToClip)))[0..1]);
@@ -321,6 +330,8 @@ pub fn main() !void {
 
         zgl.clearColor(1.0, 0.0, 1.0, 1.0);
         zgl.clear(.{ .color = true, .depth = true });
+
+        zgl.drawElements(.triangles, indices.items.len / 3, .unsigned_short, 0);
 
         sdl.gl.swapWindow(window);
     }
