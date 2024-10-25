@@ -22,6 +22,12 @@ pub fn build(b: *std.Build) void {
 
     const sdlSdk = sdl.init(b, .{});
 
+    const zmath = b.addModule("zmath", .{
+        .root_source_file = b.path("extern/zmath.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_source_file = b.path("src/main.zig"),
@@ -32,6 +38,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zgl", zgl.module("zgl"));
     exe.root_module.addImport("zgltf", zgltf.module("zgltf"));
     exe.root_module.addImport("ZigUtils", zigUtils.module("ZigUtils"));
+    exe.root_module.addImport("zmath", zmath);
 
     sdlSdk.link(exe, .dynamic, sdl.Library.SDL2);
 
@@ -46,6 +53,7 @@ pub fn build(b: *std.Build) void {
     testExe.root_module.addImport("zgl", zgl.module("zgl"));
     testExe.root_module.addImport("zgltf", zgltf.module("zgltf"));
     testExe.root_module.addImport("ZigUtils", zigUtils.module("ZigUtils"));
+    testExe.root_module.addImport("zmath", zmath);
 
     sdlSdk.link(testExe, .dynamic, sdl.Library.SDL2);
 

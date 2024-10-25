@@ -2,15 +2,41 @@ const std = @import("std");
 const math = std.math;
 const zgl = @import("zgl");
 const zgltf = @import("zgltf");
-const zmath = @import("zmath.zig");
+const zmath = @import("zmath");
+const ZigUtils = @import("ZigUtils");
 const sdl = @import("sdl");
-const MiscUtils = @import("ZigUtils").Misc;
 
 const WINDOW_WIDTH = 800;
 const WINDOW_HEIGHT = 600;
 const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
 
+const Vertex = extern struct {
+    pos: Pos,
+    normal: Normal,
+    joints: Joints,
+    weights: Weights,
+
+    pub const Pos = [3]f32;
+    pub const Normal = [3]f32;
+    pub const Joints = [4]u16;
+    pub const Weights = [4]f32;
+
+};
+
+
 pub fn main() !void {
+    var samplesDir = try std.fs.cwd().openDir("test-samples", .{});
+    defer samplesDir.close();
+
+
+    // setup allocator //
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    const allocator = gpa.allocator();
+
+
+    // setup sdl //
     try sdl.init(.{
         .video = true,
         .events = true,
@@ -29,6 +55,8 @@ pub fn main() !void {
     try sdl.gl.setAttribute(.{ .context_minor_version = 3 });
     try sdl.gl.setAttribute(.{ .context_profile_mask = .core });
 
+
+    // setup opengl //
     const glContext = try sdl.gl.createContext(window);
     defer glContext.delete();
 
@@ -36,14 +64,10 @@ pub fn main() !void {
 
     try sdl.gl.setSwapInterval(.adaptive_vsync);
 
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer std.debug.assert(gpa.deinit() == .ok);
 
-    const allocator = gpa.allocator();
-
-    const samplesDir = try std.fs.cwd().openDir("test-samples", .{});
-    const modelDir = try samplesDir.openDir("khronos", .{});
-    const shaderDir = try samplesDir.openDir("shaders", .{});
+    // load model file //
+    var modelDir = try samplesDir.openDir("khronos", .{});
+    defer modelDir.close();
 
     const gltfJSON = try modelDir.readFileAllocOptions(
         allocator,
@@ -109,18 +133,6 @@ pub fn main() !void {
 
         bufferMap[i] = bin;
     }
-
-    const Vertex = extern struct {
-        pos: Pos,
-        normal: Normal,
-        joints: Joints,
-        weights: Weights,
-
-        pub const Pos = [3]f32;
-        pub const Normal = [3]f32;
-        pub const Joints = [4]u16;
-        pub const Weights = [4]f32;
-    };
 
     var vertices = std.ArrayList(Vertex).init(allocator);
     defer vertices.deinit();
@@ -222,6 +234,10 @@ pub fn main() !void {
     std.debug.print("Indices count: {}\n", .{indices.items.len});
 
 
+    // load shaders //
+    var shaderDir = try samplesDir.openDir("shaders", .{});
+    defer shaderDir.close();
+
     const vertexSource = try shaderDir.readFileAlloc(allocator, "basic.vert", math.maxInt(u16));
     defer allocator.free(vertexSource);
 
@@ -231,7 +247,6 @@ pub fn main() !void {
     defer allocator.free(fragmentSource);
 
     std.debug.print("loaded frag src: ```\n{s}\n```\n", .{fragmentSource});
-
 
     const vertexShader = zgl.createShader(.vertex);
     vertexShader.source(1, &[1][]const u8 { vertexSource });
@@ -276,12 +291,17 @@ pub fn main() !void {
         return error.ShaderLinkingFailed;
     }
 
+    const matrixLocations = .{
+        .model = shaderProgram.uniformLocation("model") orelse return error.MissingUniform,
+        .view = shaderProgram.uniformLocation("view") orelse return error.MissingUniform,
+        .projection = shaderProgram.uniformLocation("projection") orelse return error.MissingUniform,
+    };
+
     shaderProgram.use();
 
 
-
+    // bind model data //
     const vao = zgl.createVertexArray();
-    vao.bind();
 
     const vbo = zgl.createBuffer();
     vao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex));
@@ -291,35 +311,34 @@ pub fn main() !void {
     vao.elementBuffer(ebo);
     ebo.data(u16, indices.items, .static_draw);
 
-    // position attribute
-    vao.attribFormat(0, 3, .float, true, 0);
+    vao.attribFormat(0, 3, .float, true, @offsetOf(Vertex, "pos"));
     vao.attribBinding(0, 0);
     vao.enableVertexAttribute(0);
 
-    // normal attribute
     vao.attribFormat(1, 3, .float, true, @offsetOf(Vertex, "normal"));
     vao.attribBinding(1, 0);
     vao.enableVertexAttribute(1);
 
-
-    const modelToWorld = zmath.identity();
-    const worldToView = zmath.lookAtRh(
-        zmath.f32x4(0.0, 0.25, 3.0, 1.0), // eye position
-        zmath.f32x4(0.0, 0.25, 0.0, 1.0), // focus point
-        zmath.f32x4(1.0, 0.0, 0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
-    );
-
-    const viewToClip = zmath.perspectiveFovRhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0);
-
-    const modelToView = zmath.mul(modelToWorld, worldToView);
-    const modelToClip = zmath.mul(modelToView, viewToClip);
-
-    const matrixLocation = shaderProgram.uniformLocation("modelToClip") orelse return error.MissingUniform;
-
-    // Transposition is needed because GLSL uses column-major matrices by default
-    shaderProgram.uniformMatrix4(matrixLocation, true, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&modelToClip)))[0..1]);
+    vao.bind();
 
 
+    // bind matrix data //
+    const matrices = .{
+        .model = zmath.identity(),
+        .view = zmath.lookAtLh(
+            zmath.f32x4(0.0, 0.25, 3.0, 1.0), // eye position
+            zmath.f32x4(0.0, 0.25, 0.0, 1.0), // focus point
+            zmath.f32x4(1.0, 0.0, 0.0, 0.0),  // up direction ('w' coord is zero because this is a vector not a point)
+        ),
+        .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0),
+    };
+
+    shaderProgram.uniformMatrix4(matrixLocations.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
+    shaderProgram.uniformMatrix4(matrixLocations.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
+    shaderProgram.uniformMatrix4(matrixLocations.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
+
+
+    // run //
     mainLoop: while (true) {
         while (sdl.pollEvent()) |ev| {
             switch (ev) {
