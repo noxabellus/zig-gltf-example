@@ -326,9 +326,9 @@ pub fn main() !void {
     const matrices = .{
         .model = zmath.identity(),
         .view = zmath.lookAtLh(
-            zmath.f32x4(0.0, 0.25, 3.0, 1.0), // eye position
-            zmath.f32x4(0.0, 0.25, 0.0, 1.0), // focus point
-            zmath.f32x4(1.0, 0.0, 0.0, 0.0),  // up direction ('w' coord is zero because this is a vector not a point)
+            zmath.f32x4(0.0, 1.0, 3.0, 1.0), // eye position
+            zmath.f32x4(0.0, 1.0, 0.0, 1.0), // focus point
+            zmath.f32x4(0.0, 1.0, 0.0, 0.0),  // up direction ('w' coord is zero because this is a vector not a point)
         ),
         .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0),
     };
@@ -336,6 +336,10 @@ pub fn main() !void {
     shaderProgram.uniformMatrix4(matrixLocations.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
     shaderProgram.uniformMatrix4(matrixLocations.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
     shaderProgram.uniformMatrix4(matrixLocations.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
+
+
+    // use wireframe mode //
+    zgl.polygonMode(.front_and_back, .line);
 
 
     // run //
@@ -347,10 +351,10 @@ pub fn main() !void {
             }
         }
 
-        zgl.clearColor(1.0, 0.0, 1.0, 1.0);
+        zgl.clearColor(0.0, 0.0, 0.0, 1.0);
         zgl.clear(.{ .color = true, .depth = true });
 
-        zgl.drawElements(.triangles, indices.items.len / 3, .unsigned_short, 0);
+        zgl.drawElements(.triangles, indices.items.len, .unsigned_short, 0);
 
         sdl.gl.swapWindow(window);
     }
