@@ -291,35 +291,49 @@ pub fn main() !void {
         return error.ShaderLinkingFailed;
     }
 
-    const matrixLocations = .{
+    const uniforms = .{
         .model = shaderProgram.uniformLocation("model") orelse return error.MissingUniform,
         .view = shaderProgram.uniformLocation("view") orelse return error.MissingUniform,
         .projection = shaderProgram.uniformLocation("projection") orelse return error.MissingUniform,
+        .color = shaderProgram.uniformLocation("color") orelse return error.MissingUniform,
     };
 
     shaderProgram.use();
 
 
     // bind model data //
-    const vao = zgl.createVertexArray();
+    const meshVao = zgl.createVertexArray();
+    {
+        const vbo = zgl.createBuffer();
+        meshVao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex));
+        vbo.data(Vertex, vertices.items, .static_draw);
 
-    const vbo = zgl.createBuffer();
-    vao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex));
-    vbo.data(Vertex, vertices.items, .static_draw);
+        const ebo = zgl.createBuffer();
+        meshVao.elementBuffer(ebo);
+        ebo.data(u16, indices.items, .static_draw);
 
-    const ebo = zgl.createBuffer();
-    vao.elementBuffer(ebo);
-    ebo.data(u16, indices.items, .static_draw);
+        meshVao.attribFormat(0, 3, .float, true, @offsetOf(Vertex, "pos"));
+        meshVao.attribBinding(0, 0);
+        meshVao.enableVertexAttribute(0);
+    }
 
-    vao.attribFormat(0, 3, .float, true, @offsetOf(Vertex, "pos"));
-    vao.attribBinding(0, 0);
-    vao.enableVertexAttribute(0);
 
-    vao.attribFormat(1, 3, .float, true, @offsetOf(Vertex, "normal"));
-    vao.attribBinding(1, 0);
-    vao.enableVertexAttribute(1);
+    var lineVertices = std.ArrayList(Vertex.Pos).init(allocator);
+    defer lineVertices.deinit();
 
-    vao.bind();
+    try lineVertices.append([3]f32 { 0.0, 0.0, 0.0 });
+    try lineVertices.append([3]f32 { 0.0, 2.0, 0.0 });
+
+    const lineVao = zgl.createVertexArray();
+    {
+        const vbo = zgl.createBuffer();
+        lineVao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex.Pos));
+        vbo.data(Vertex.Pos, lineVertices.items, .static_draw);
+
+        lineVao.attribFormat(0, 3, .float, false, 0);
+        lineVao.attribBinding(0, 0);
+        lineVao.enableVertexAttribute(0);
+    }
 
 
     // bind matrix data //
@@ -328,18 +342,14 @@ pub fn main() !void {
         .view = zmath.lookAtLh(
             zmath.f32x4(0.0, 1.0, 3.0, 1.0), // eye position
             zmath.f32x4(0.0, 1.0, 0.0, 1.0), // focus point
-            zmath.f32x4(0.0, 1.0, 0.0, 0.0),  // up direction ('w' coord is zero because this is a vector not a point)
+            zmath.f32x4(0.0, 1.0, 0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
         ),
         .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0),
     };
 
-    shaderProgram.uniformMatrix4(matrixLocations.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
-    shaderProgram.uniformMatrix4(matrixLocations.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
-    shaderProgram.uniformMatrix4(matrixLocations.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
-
-
-    // use wireframe mode //
-    zgl.polygonMode(.front_and_back, .line);
+    shaderProgram.uniformMatrix4(uniforms.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
+    shaderProgram.uniformMatrix4(uniforms.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
+    shaderProgram.uniformMatrix4(uniforms.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
 
 
     // run //
@@ -354,7 +364,19 @@ pub fn main() !void {
         zgl.clearColor(0.0, 0.0, 0.0, 1.0);
         zgl.clear(.{ .color = true, .depth = true });
 
+        zgl.pointSize(10.0);
+        zgl.polygonMode(.front_and_back, .line);
+
+        meshVao.bind();
+        shaderProgram.uniform3f(uniforms.color, 1.0, 0.5, 0.2);
         zgl.drawElements(.triangles, indices.items.len, .unsigned_short, 0);
+
+        lineVao.bind();
+        shaderProgram.uniform3f(uniforms.color, 0.0, 1.0, 0.0);
+        zgl.drawArrays(.lines, 0, lineVertices.items.len);
+
+        shaderProgram.uniform3f(uniforms.color, 1.0, 1.0, 1.0);
+        zgl.drawArrays(.points, 0, lineVertices.items.len);
 
         sdl.gl.swapWindow(window);
     }
