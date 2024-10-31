@@ -10,17 +10,29 @@ const WINDOW_WIDTH = 800;
 const WINDOW_HEIGHT = 600;
 const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
 
+const Pos = [3]f32;
+
 const Vertex = extern struct {
     pos: Pos,
     normal: Normal,
     joints: Joints,
     weights: Weights,
 
-    pub const Pos = [3]f32;
     pub const Normal = [3]f32;
     pub const Joints = [4]u16;
     pub const Weights = [4]f32;
+};
 
+const Node = struct {
+    pos: Pos,
+    rot: zmath.Quat,
+    scl: Scale,
+    inv: InverseBindMatrix,
+
+    // TODO: hierarchy
+
+    pub const Scale = [3]f32;
+    pub const InverseBindMatrix = [16]f32;
 };
 
 
@@ -134,6 +146,8 @@ pub fn main() !void {
         bufferMap[i] = bin;
     }
 
+
+    // load mesh data //
     var vertices = std.ArrayList(Vertex).init(allocator);
     defer vertices.deinit();
 
@@ -234,6 +248,98 @@ pub fn main() !void {
     std.debug.print("Indices count: {}\n", .{indices.items.len});
 
 
+    // load skin data //
+    var nodes = std.ArrayList(Node).init(allocator);
+    defer nodes.deinit();
+
+    const skin = gltf.data.skins.items[0];
+    std.debug.assert(gltf.data.skins.items.len == 1);
+    std.debug.print("skin name: {s}\n", .{skin.name});
+
+    { // bind matrices
+        const accessor = gltf.data.accessors.items[skin.inverse_bind_matrices.?];
+
+        _ = try nodes.addManyAt(0, @intCast(accessor.count));
+
+        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+        var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+        while (it.next()) |x| {
+            const b, const i = x;
+
+            // TODO: is this the right format? or do we need to transpose?
+            nodes.items[i].inv = .{
+                b[0],  b[1],  b[2],  b[3],
+                b[4],  b[5],  b[6],  b[7],
+                b[8],  b[9],  b[10], b[11],
+                b[12], b[13], b[14], b[15],
+            };
+        }
+    }
+
+    { // nodes
+        const jointIndices = skin.joints.items;
+
+        std.debug.assert(jointIndices.len == nodes.items.len);
+
+        const nodesView = gltf.data.nodes.items;
+
+        // TODO: we need to save the hierarchy, but
+        // if there are children that are not in jointIndices, ... error?
+
+        for (jointIndices, 0..) |j, i| {
+            const node = nodesView[j];
+
+            nodes.items[i].pos = node.translation;
+            nodes.items[i].rot = .{ node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3] };
+            nodes.items[i].scl = node.scale;
+        }
+    }
+
+
+    // load animation data //
+    const animation = gltf.data.animations.items[0];
+    std.debug.assert(gltf.data.animations.items.len == 1);
+
+    { // samplers
+        const samplers = animation.samplers.items;
+
+        for (samplers, 0..) |sampler, s| {
+            std.debug.print("sampler {}: {}\n", .{s, sampler});
+
+            std.debug.assert(sampler.interpolation == .linear);
+
+            const inputAccessor = gltf.data.accessors.items[sampler.input];
+            const outputAccessor = gltf.data.accessors.items[sampler.output];
+
+            const inputBufferView = gltf.data.buffer_views.items[inputAccessor.buffer_view.?];
+            const outputBufferView = gltf.data.buffer_views.items[outputAccessor.buffer_view.?];
+
+            var inputIt = IndexedAccessorIterator(f32).init(&gltf, inputAccessor, bufferMap[inputBufferView.buffer]);
+            var outputIt = outputAccessor.iterator(f32, &gltf, bufferMap[outputBufferView.buffer]);
+
+            while (inputIt.next()) |x| {
+                const input, const i = x;
+
+                const output = outputIt.next() orelse return error.MissingOutput;
+
+                std.debug.print("\tindex {}\n", .{i});
+                std.debug.print("\t\tinput: {any}\n", .{input});
+                std.debug.print("\t\toutput: {any}\n", .{output});
+            }
+        }
+    }
+
+    // TODO: create in memory animation format
+    { // channels
+        const channels = animation.channels.items;
+
+        for (channels, 0..) |channel, c| {
+            std.debug.print("channel {}: {}\n", .{c, channel});
+        }
+    }
+
+
     // load shaders //
     var shaderDir = try samplesDir.openDir("shaders", .{});
     defer shaderDir.close();
@@ -301,7 +407,7 @@ pub fn main() !void {
     shaderProgram.use();
 
 
-    // bind model data //
+    // bind mesh data //
     const meshVao = zgl.createVertexArray();
     {
         const vbo = zgl.createBuffer();
@@ -318,21 +424,37 @@ pub fn main() !void {
     }
 
 
-    var lineVertices = std.ArrayList(Vertex.Pos).init(allocator);
-    defer lineVertices.deinit();
+    // bind skin data //
+    var skinVertices = std.ArrayList(Pos).init(allocator);
+    defer skinVertices.deinit();
+    {
+        var parentMatrix = zmath.identity();
 
-    try lineVertices.append([3]f32 { 0.0, 0.0, 0.0 });
-    try lineVertices.append([3]f32 { 0.0, 2.0, 0.0 });
+        for (nodes.items) |node| {
+            const pos = zmath.translation(node.pos[0], node.pos[1], node.pos[2]);
+            const rot = zmath.quatToMat(node.rot);
+            const scl = zmath.scaling(node.scl[0], node.scl[1], node.scl[2]);
 
-    const lineVao = zgl.createVertexArray();
+            const localMatrix = zmath.mul(zmath.mul(pos, rot), scl);
+            const worldMatrix = zmath.mul(parentMatrix, localMatrix);
+
+            const worldPos = zmath.mul(zmath.f32x4(0.0, 0.0, 0.0, 1.0), worldMatrix);
+
+            try skinVertices.append(.{ worldPos[0], worldPos[1], worldPos[2] });
+
+            parentMatrix = worldMatrix;
+        }
+    }
+
+    const skinVao = zgl.createVertexArray();
     {
         const vbo = zgl.createBuffer();
-        lineVao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex.Pos));
-        vbo.data(Vertex.Pos, lineVertices.items, .static_draw);
+        skinVao.vertexBuffer(0, vbo, 0, @sizeOf(Pos));
+        vbo.data(Pos, skinVertices.items, .static_draw);
 
-        lineVao.attribFormat(0, 3, .float, false, 0);
-        lineVao.attribBinding(0, 0);
-        lineVao.enableVertexAttribute(0);
+        skinVao.attribFormat(0, 3, .float, false, 0);
+        skinVao.attribBinding(0, 0);
+        skinVao.enableVertexAttribute(0);
     }
 
 
@@ -371,12 +493,12 @@ pub fn main() !void {
         shaderProgram.uniform3f(uniforms.color, 1.0, 0.5, 0.2);
         zgl.drawElements(.triangles, indices.items.len, .unsigned_short, 0);
 
-        lineVao.bind();
+        skinVao.bind();
         shaderProgram.uniform3f(uniforms.color, 0.0, 1.0, 0.0);
-        zgl.drawArrays(.lines, 0, lineVertices.items.len);
+        zgl.drawArrays(.lines, 0, skinVertices.items.len);
 
         shaderProgram.uniform3f(uniforms.color, 1.0, 1.0, 1.0);
-        zgl.drawArrays(.points, 0, lineVertices.items.len);
+        zgl.drawArrays(.points, 0, skinVertices.items.len);
 
         sdl.gl.swapWindow(window);
     }
