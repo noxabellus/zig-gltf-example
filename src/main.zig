@@ -331,6 +331,9 @@ pub fn main() !void {
     }
 
     // TODO: create in memory animation format
+    //       typically, we would have an animation channel for each component of each joint
+    //       however, gltf animations are not required to have a channel for each component, or for each joint
+    //       so, create a format that can handle this, or convert the gltf input to a more standard format?
     { // channels
         const channels = animation.channels.items;
 
