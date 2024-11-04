@@ -11,6 +11,7 @@ const WINDOW_HEIGHT = 600;
 const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
 
 const Pos = [3]f32;
+const Scale = [3]f32;
 
 const Vertex = extern struct {
     pos: Pos,
@@ -23,17 +24,102 @@ const Vertex = extern struct {
     pub const Weights = [4]f32;
 };
 
-const Node = struct {
+const Transform = struct {
     pos: Pos,
     rot: zmath.Quat,
     scl: Scale,
+};
+
+const Node = struct {
+    tran: Transform,
     inv: InverseBindMatrix,
+    children: [MAX_BONES]BoneIndex,
+    num_children: BoneIndex,
 
     // TODO: hierarchy
-
-    pub const Scale = [3]f32;
     pub const InverseBindMatrix = [16]f32;
 };
+
+const BoneIndex = u8;
+const MAX_BONES = std.math.maxInt(BoneIndex);
+
+const Skeleton = struct {
+    bones: [MAX_BONES]Node,
+    num_bones: BoneIndex,
+    fn getBone(self: *const Skeleton, boneIndex: BoneIndex) ?*const Node {
+        return if (boneIndex < self.num_bones) &self.bones[boneIndex] else null;
+    }
+};
+
+const Animation = struct {
+    bones: [MAX_BONES]?*const BoneAnimation,
+    num_bones: BoneIndex,
+    fn getBone(self: *const Animation, boneIndex: BoneIndex) ?*const BoneAnimation {
+        return if (boneIndex < self.num_bones) self.bones[boneIndex] else null;
+    }
+};
+
+const BoneAnimation = struct {
+    positions: std.ArrayList(Keyframe(Pos)),
+    rotations: std.ArrayList(Keyframe(zmath.Quat)),
+    scales: std.ArrayList(Keyframe(Scale)),
+    fn findKeyframeIndex(comptime T: type, keyframes: []const Keyframe(T), time: f32) usize {
+        var i = 0;
+        while (i < keyframes.len) : (i += 1) {
+            if (keyframes[i].time >= time) break;
+        }
+        return i;
+    }
+    fn getInterpolation(comptime T: type, comptime method: enum { lerp, slerp }, keyframes: []const Keyframe(T), time: f32) T {
+        return switch (method) {
+            .lerp => {
+                const i = findKeyframeIndex(keyframes, time);
+                const a = keyframes[i];
+                const b = keyframes[i + 1];
+                const t = (time - a.time) / (b.time - a.time);
+                return a.value + (b.value - a.value) * t;
+            },
+            .slerp => {
+                const i = findKeyframeIndex(keyframes, time);
+                const a = keyframes[i];
+                const b = keyframes[i + 1];
+                const t = (time - a.time) / (b.time - a.time);
+                return zmath.slerp(a.value, b.value, t);
+            },
+        };
+    }
+
+    fn getPos(self: *const BoneAnimation, time: f32) ?Pos {
+        return if (self.positions.len == 0) null else getInterpolation(.lerp, self.positions.items, time);
+    }
+
+    fn getRot(self: *const BoneAnimation, time: f32) ?zmath.Quat {
+        return if (self.rotations.len == 0) null else getInterpolation(.slerp, self.rotations.items, time);
+    }
+
+    fn getScl(self: *const BoneAnimation, time: f32) ?Scale {
+        return if (self.scales.len == 0) null else getInterpolation(.lerp, self.scales.items, time);
+    }
+};
+
+fn Keyframe (comptime T: type) type {
+    return struct {
+        time: f32,
+        value: T,
+    };
+}
+
+fn computeAnimationTransform(boneIndex: BoneIndex, anim: Animation, skeleton: Skeleton, time: f32) !Transform {
+    const base = skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex;
+
+    if (anim.getBone(boneIndex)) |boneAnim| {
+        if (boneAnim.getPos(time)) |pos| base.pos = pos;
+        if (boneAnim.getRot(time)) |rot| base.rot = rot;
+        if (boneAnim.getScl(time)) |scl| base.scl = scl;
+    }
+
+    return base;
+}
 
 
 pub fn main() !void {
@@ -284,15 +370,15 @@ pub fn main() !void {
 
         const nodesView = gltf.data.nodes.items;
 
-        // TODO: we need to save the hierarchy, but
-        // if there are children that are not in jointIndices, ... error?
-
+        // TODO: we need to save the hierarchy
         for (jointIndices, 0..) |j, i| {
             const node = nodesView[j];
 
-            nodes.items[i].pos = node.translation;
-            nodes.items[i].rot = .{ node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3] };
-            nodes.items[i].scl = node.scale;
+            nodes.items[i].tran = .{
+                .pos = node.translation,
+                .rot = .{ node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3] },
+                .scl = node.scale,
+            };
         }
     }
 
@@ -330,10 +416,7 @@ pub fn main() !void {
         }
     }
 
-    // TODO: create in memory animation format
-    //       typically, we would have an animation channel for each component of each joint
-    //       however, gltf animations are not required to have a channel for each component, or for each joint
-    //       so, create a format that can handle this, or convert the gltf input to a more standard format?
+
     { // channels
         const channels = animation.channels.items;
 
@@ -434,9 +517,9 @@ pub fn main() !void {
         var parentMatrix = zmath.identity();
 
         for (nodes.items) |node| {
-            const pos = zmath.translation(node.pos[0], node.pos[1], node.pos[2]);
-            const rot = zmath.quatToMat(node.rot);
-            const scl = zmath.scaling(node.scl[0], node.scl[1], node.scl[2]);
+            const pos = zmath.translation(node.tran.pos[0], node.tran.pos[1], node.tran.pos[2]);
+            const rot = zmath.quatToMat(node.tran.rot);
+            const scl = zmath.scaling(node.tran.scl[0], node.tran.scl[1], node.tran.scl[2]);
 
             const localMatrix = zmath.mul(zmath.mul(pos, rot), scl);
             const worldMatrix = zmath.mul(parentMatrix, localMatrix);
