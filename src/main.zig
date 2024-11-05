@@ -6,119 +6,179 @@ const zmath = @import("zmath");
 const ZigUtils = @import("ZigUtils");
 const sdl = @import("sdl");
 
+const Mat4 = zmath.Mat4;
+const Vec4 = zmath.Vec4;
+const Quat = zmath.Quat;
+const Vec3 = @Vector(3, f32);
+
 const WINDOW_WIDTH = 800;
 const WINDOW_HEIGHT = 600;
 const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
 
-const Pos = [3]f32;
-const Scale = [3]f32;
 
 const Vertex = extern struct {
     pos: Pos,
     normal: Normal,
-    joints: Joints,
     weights: Weights,
+    joints: Joints,
 
+    pub const Pos = [3]f32;
     pub const Normal = [3]f32;
-    pub const Joints = [4]u16;
     pub const Weights = [4]f32;
+    pub const Joints = [4]u16;
 };
 
 const Transform = struct {
-    pos: Pos,
-    rot: zmath.Quat,
-    scl: Scale,
+    pos: Vec3,
+    rot: Quat,
+    scl: Vec3,
 };
 
-const Node = struct {
+const Bone = struct {
     tran: Transform,
-    inv: InverseBindMatrix,
+    inv: zmath.Mat4,
+    parent: ?BoneIndex,
     children: [MAX_BONES]BoneIndex,
     num_children: BoneIndex,
-
-    // TODO: hierarchy
-    pub const InverseBindMatrix = [16]f32;
 };
 
 const BoneIndex = u8;
 const MAX_BONES = std.math.maxInt(BoneIndex);
 
 const Skeleton = struct {
-    bones: [MAX_BONES]Node,
+    bones: [MAX_BONES]Bone,
     num_bones: BoneIndex,
-    fn getBone(self: *const Skeleton, boneIndex: BoneIndex) ?*const Node {
+
+    fn getBone(self: *const Skeleton, boneIndex: BoneIndex) ?*const Bone {
         return if (boneIndex < self.num_bones) &self.bones[boneIndex] else null;
+    }
+
+    fn addBones(self: *Skeleton, map: *NodeBoneMap, nodes: []const zgltf.Node, nodeIndex: usize, parentBoneIndex: ?BoneIndex) !BoneIndex {
+        if (map.contains(nodeIndex)) return error.DuplicateBone;
+
+        const boneIndex = self.num_bones;
+        self.num_bones += 1;
+
+        try map.put(nodeIndex, boneIndex);
+
+        const node = &nodes[nodeIndex];
+        const bone = &self.bones[boneIndex];
+
+        bone.tran = .{
+            .pos = node.translation,
+            .rot = .{ node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3] },
+            .scl = node.scale,
+        };
+
+        bone.parent = parentBoneIndex;
+        bone.num_children = 0;
+
+        for (nodes[nodeIndex].children.items) |childNodeIndex| {
+            const childBoneIndex = try self.addBones(map, nodes, childNodeIndex, boneIndex);
+            const childLocalIndex = bone.num_children;
+            bone.num_children += 1;
+            bone.children[childLocalIndex] = childBoneIndex;
+        }
+
+        return boneIndex;
+    }
+
+    fn generateBoneVertices(self: *const Skeleton, output: *std.ArrayList([3]f32), parentMatrix: Mat4, boneIndex: BoneIndex) !void {
+        const bone = self.bones[boneIndex];
+
+        const pos = zmath.translation(bone.tran.pos[0], bone.tran.pos[1], bone.tran.pos[2]);
+        const rot = zmath.quatToMat(bone.tran.rot);
+        const scl = zmath.scaling(bone.tran.scl[0], bone.tran.scl[1], bone.tran.scl[2]);
+
+        const localMatrix = zmath.mul(zmath.mul(pos, rot), scl);
+        const worldMatrix = zmath.mul(parentMatrix, localMatrix);
+
+        const worldPos = zmath.mul(zmath.f32x4(0.0, 0.0, 0.0, 1.0), worldMatrix);
+
+        try output.append(.{ worldPos[0], worldPos[1], worldPos[2] });
+
+        for (bone.children[0..bone.num_children]) |childBoneIndex| {
+            try self.generateBoneVertices(output, worldMatrix, childBoneIndex);
+        }
     }
 };
 
+const NodeBoneMap = std.ArrayHashMap(usize, BoneIndex, ZigUtils.Misc.SimpleHashContext, false);
+
 const Animation = struct {
-    bones: [MAX_BONES]?*const BoneAnimation,
-    num_bones: BoneIndex,
+    bones: [MAX_BONES]?BoneAnimation,
+
     fn getBone(self: *const Animation, boneIndex: BoneIndex) ?*const BoneAnimation {
-        return if (boneIndex < self.num_bones) self.bones[boneIndex] else null;
+        return if (self.bones[boneIndex]) &self.bones[boneIndex] else null;
+    }
+
+    fn computeBoneTransform(self: *const Animation, boneIndex: BoneIndex, skeleton: Skeleton, time: f32) !Transform {
+        const base = skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex;
+
+        if (self.getBone(boneIndex)) |boneAnim| {
+            if (boneAnim.getPos(time)) |pos| base.pos = pos;
+            if (boneAnim.getRot(time)) |rot| base.rot = rot;
+            if (boneAnim.getScl(time)) |scl| base.scl = scl;
+        }
+
+        return base;
     }
 };
 
 const BoneAnimation = struct {
-    positions: std.ArrayList(Keyframe(Pos)),
-    rotations: std.ArrayList(Keyframe(zmath.Quat)),
-    scales: std.ArrayList(Keyframe(Scale)),
-    fn findKeyframeIndex(comptime T: type, keyframes: []const Keyframe(T), time: f32) usize {
-        var i = 0;
-        while (i < keyframes.len) : (i += 1) {
-            if (keyframes[i].time >= time) break;
-        }
-        return i;
-    }
-    fn getInterpolation(comptime T: type, comptime method: enum { lerp, slerp }, keyframes: []const Keyframe(T), time: f32) T {
+    positions: Channel(Vec3),
+    rotations: Channel(Quat),
+    scales: Channel(Vec3),
+
+    fn getInterpolation(comptime T: type, comptime method: enum { lerp, slerp }, channel: *const Channel(T), time: f32) T {
+        const relativeTime = channel.computeRelativeTime(time);
+        const a, const b = channel.findKeyframes(relativeTime);
+        const t = (relativeTime - a.time) / (b.time - a.time);
         return switch (method) {
-            .lerp => {
-                const i = findKeyframeIndex(keyframes, time);
-                const a = keyframes[i];
-                const b = keyframes[i + 1];
-                const t = (time - a.time) / (b.time - a.time);
-                return a.value + (b.value - a.value) * t;
-            },
-            .slerp => {
-                const i = findKeyframeIndex(keyframes, time);
-                const a = keyframes[i];
-                const b = keyframes[i + 1];
-                const t = (time - a.time) / (b.time - a.time);
-                return zmath.slerp(a.value, b.value, t);
-            },
+            .lerp => zmath.lerp(a.value, b.value, t),
+            .slerp => zmath.slerp(a.value, b.value, t),
         };
     }
 
-    fn getPos(self: *const BoneAnimation, time: f32) ?Pos {
+    fn getPos(self: *const BoneAnimation, time: f32) ?Vec3 {
         return if (self.positions.len == 0) null else getInterpolation(.lerp, self.positions.items, time);
     }
 
-    fn getRot(self: *const BoneAnimation, time: f32) ?zmath.Quat {
+    fn getRot(self: *const BoneAnimation, time: f32) ?Quat {
         return if (self.rotations.len == 0) null else getInterpolation(.slerp, self.rotations.items, time);
     }
 
-    fn getScl(self: *const BoneAnimation, time: f32) ?Scale {
+    fn getScl(self: *const BoneAnimation, time: f32) ?Vec3 {
         return if (self.scales.len == 0) null else getInterpolation(.lerp, self.scales.items, time);
     }
 };
+
+fn Channel (comptime T: type) type {
+    return struct {
+        length: f32,
+        keyframes: []Keyframe(T),
+
+        const Self = @This();
+
+        fn computeRelativeTime(self: *const Self, absoluteTime: f32) f32 {
+            return @mod(absoluteTime, self.length);
+        }
+
+        fn findKeyframes(self: *const Self, relativeTime: f32) struct { *const Keyframe(T), *const Keyframe(T) } {
+            var i = 0;
+            while (i < self.keyframes.len) : (i += 1) {
+                if (self.keyframes[i].time >= relativeTime) break;
+            }
+            return .{ &self.keyframes[i], &self.keyframes[@mod(i + 1, self.keyframes.len)] };
+        }
+    };
+}
 
 fn Keyframe (comptime T: type) type {
     return struct {
         time: f32,
         value: T,
     };
-}
-
-fn computeAnimationTransform(boneIndex: BoneIndex, anim: Animation, skeleton: Skeleton, time: f32) !Transform {
-    const base = skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex;
-
-    if (anim.getBone(boneIndex)) |boneAnim| {
-        if (boneAnim.getPos(time)) |pos| base.pos = pos;
-        if (boneAnim.getRot(time)) |rot| base.rot = rot;
-        if (boneAnim.getScl(time)) |scl| base.scl = scl;
-    }
-
-    return base;
 }
 
 
@@ -335,17 +395,37 @@ pub fn main() !void {
 
 
     // load skin data //
-    var nodes = std.ArrayList(Node).init(allocator);
-    defer nodes.deinit();
+    var skeleton = Skeleton {
+        .bones = undefined,
+        .num_bones = 0,
+    };
+
+    var nodeBoneMap = NodeBoneMap.init(allocator);
+    defer nodeBoneMap.deinit();
 
     const skin = gltf.data.skins.items[0];
     std.debug.assert(gltf.data.skins.items.len == 1);
     std.debug.print("skin name: {s}\n", .{skin.name});
 
+    { // hierarchy
+        const jointNodeIndices = skin.joints.items;
+        std.debug.assert(jointNodeIndices.len <= MAX_BONES and jointNodeIndices.len > 0);
+
+        const rootNodeIndex = skin.skeleton orelse skin.joints.items[0];
+
+        const nodes = gltf.data.nodes.items;
+
+        _ = try skeleton.addBones(&nodeBoneMap, nodes, rootNodeIndex, null);
+
+        for (jointNodeIndices) |jointNodeIndex| {
+            std.debug.assert(nodeBoneMap.contains(jointNodeIndex));
+        }
+    }
+
     { // bind matrices
         const accessor = gltf.data.accessors.items[skin.inverse_bind_matrices.?];
 
-        _ = try nodes.addManyAt(0, @intCast(accessor.count));
+        std.debug.assert(skeleton.num_bones == @as(usize, @intCast(accessor.count)));
 
         const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
 
@@ -353,31 +433,14 @@ pub fn main() !void {
         while (it.next()) |x| {
             const b, const i = x;
 
+            const j = nodeBoneMap.get(skin.joints.items[i]) orelse return error.InvalidBindMatrix;
+
             // TODO: is this the right format? or do we need to transpose?
-            nodes.items[i].inv = .{
-                b[0],  b[1],  b[2],  b[3],
-                b[4],  b[5],  b[6],  b[7],
-                b[8],  b[9],  b[10], b[11],
-                b[12], b[13], b[14], b[15],
-            };
-        }
-    }
-
-    { // nodes
-        const jointIndices = skin.joints.items;
-
-        std.debug.assert(jointIndices.len == nodes.items.len);
-
-        const nodesView = gltf.data.nodes.items;
-
-        // TODO: we need to save the hierarchy
-        for (jointIndices, 0..) |j, i| {
-            const node = nodesView[j];
-
-            nodes.items[i].tran = .{
-                .pos = node.translation,
-                .rot = .{ node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3] },
-                .scl = node.scale,
+            skeleton.bones[j].inv = .{
+                .{ b[0],  b[1],  b[2],  b[3]  },
+                .{ b[4],  b[5],  b[6],  b[7]  },
+                .{ b[8],  b[9],  b[10], b[11] },
+                .{ b[12], b[13], b[14], b[15] },
             };
         }
     }
@@ -511,32 +574,17 @@ pub fn main() !void {
 
 
     // bind skin data //
-    var skinVertices = std.ArrayList(Pos).init(allocator);
+    var skinVertices = std.ArrayList(Vertex.Pos).init(allocator);
     defer skinVertices.deinit();
     {
-        var parentMatrix = zmath.identity();
-
-        for (nodes.items) |node| {
-            const pos = zmath.translation(node.tran.pos[0], node.tran.pos[1], node.tran.pos[2]);
-            const rot = zmath.quatToMat(node.tran.rot);
-            const scl = zmath.scaling(node.tran.scl[0], node.tran.scl[1], node.tran.scl[2]);
-
-            const localMatrix = zmath.mul(zmath.mul(pos, rot), scl);
-            const worldMatrix = zmath.mul(parentMatrix, localMatrix);
-
-            const worldPos = zmath.mul(zmath.f32x4(0.0, 0.0, 0.0, 1.0), worldMatrix);
-
-            try skinVertices.append(.{ worldPos[0], worldPos[1], worldPos[2] });
-
-            parentMatrix = worldMatrix;
-        }
+        try skeleton.generateBoneVertices(&skinVertices, zmath.identity(), 0);
     }
 
     const skinVao = zgl.createVertexArray();
     {
         const vbo = zgl.createBuffer();
-        skinVao.vertexBuffer(0, vbo, 0, @sizeOf(Pos));
-        vbo.data(Pos, skinVertices.items, .static_draw);
+        skinVao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex.Pos));
+        vbo.data(Vertex.Pos, skinVertices.items, .static_draw);
 
         skinVao.attribFormat(0, 3, .float, false, 0);
         skinVao.attribBinding(0, 0);
@@ -580,9 +628,6 @@ pub fn main() !void {
         zgl.drawElements(.triangles, indices.items.len, .unsigned_short, 0);
 
         skinVao.bind();
-        shaderProgram.uniform3f(uniforms.color, 0.0, 1.0, 0.0);
-        zgl.drawArrays(.lines, 0, skinVertices.items.len);
-
         shaderProgram.uniform3f(uniforms.color, 1.0, 1.0, 1.0);
         zgl.drawArrays(.points, 0, skinVertices.items.len);
 
