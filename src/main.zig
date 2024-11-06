@@ -113,15 +113,20 @@ const NodeBoneMap = std.ArrayHashMap(usize, BoneIndex, ZigUtils.Misc.SimpleHashC
 const Animation = struct {
     bones: [MAX_BONES]?BoneAnimation = [1]?BoneAnimation { null } ** MAX_BONES,
 
+    fn deinit(self: *Animation, allocator: std.mem.Allocator) void {
+        for (0..MAX_BONES) |boneIndex| {
+            if (self.bones[boneIndex]) |*b| b.deinit(allocator);
+        }
+    }
+
     fn getBone(self: *const Animation, boneIndex: BoneIndex) ?*const BoneAnimation {
-        return if (self.bones[boneIndex] != null) &self.bones[boneIndex].? else null;
+        return if (self.bones[boneIndex]) |*bone| bone else null;
     }
 
     fn getOrInitBone(self: *Animation, boneIndex: BoneIndex) *BoneAnimation {
-        if (self.bones[boneIndex] == null) {
-            self.bones[boneIndex] = BoneAnimation {};
-        }
+        if (self.bones[boneIndex]) |*bone| return bone;
 
+        self.bones[boneIndex] = BoneAnimation {};
         return &self.bones[boneIndex].?;
     }
 
@@ -159,6 +164,12 @@ const BoneAnimation = struct {
     rotations: Channel(Quat) = .{},
     scales: Channel(Vec3) = .{},
 
+    fn deinit(self: *BoneAnimation, allocator: std.mem.Allocator) void {
+        self.positions.deinit(allocator);
+        self.rotations.deinit(allocator);
+        self.scales.deinit(allocator);
+    }
+
     fn getPos(self: *const BoneAnimation, time: f32) ?Vec3 {
         return if (self.positions.hasFrames()) self.positions.getInterpolation(.lerp, time) else null;
     }
@@ -181,6 +192,12 @@ fn Channel (comptime T: type) type {
 
         fn init(self: *Self, allocator: std.mem.Allocator, numFrames: usize) !void {
             self.keyframes = try allocator.alloc(Keyframe(T), numFrames);
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.keyframes);
+            self.length = 0.0;
+            self.keyframes = &[0]Keyframe(T) {};
         }
 
         fn hasFrames(self: *const Self) bool {
@@ -488,6 +505,7 @@ pub fn main() !void {
     std.debug.assert(gltf.data.animations.items.len == 1);
 
     var animation = Animation {};
+    defer animation.deinit(allocator);
 
     { // channels
         const channels = glAnimation.channels.items;
