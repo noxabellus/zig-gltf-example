@@ -210,10 +210,14 @@ fn Channel (comptime T: type) type {
 
         fn findKeyframes(self: *const Self, relativeTime: f32) struct { *const Keyframe(T), *const Keyframe(T) } {
             var i: usize = 0;
+
             while (i < self.keyframes.len) : (i += 1) {
                 if (self.keyframes[i].time >= relativeTime) break;
             }
-            return .{ &self.keyframes[i], &self.keyframes[@mod(i + 1, self.keyframes.len)] };
+
+            return
+                if (i == 0) .{ &self.keyframes[0], &self.keyframes[self.keyframes.len - 1] }
+                else .{ &self.keyframes[i - 1], &self.keyframes[i] };
         }
 
         fn getInterpolation(self: *const Channel(T), comptime method: enum { lerp, slerp }, time: f32) T {
@@ -583,6 +587,42 @@ pub fn main() !void {
                     }
                 },
                 else => std.debug.print("Unhandled channel property: {s}\n", .{@tagName(channel.target.property)}),
+            }
+        }
+    }
+
+    for (animation.bones, 0..) |boneAnim, boneIndex| {
+        if (boneAnim) |*b| {
+            std.debug.print("Bone {} animation:\n", .{boneIndex});
+
+            if (b.positions.hasFrames()) {
+                std.debug.print("\tpositions ({d:.3}):", .{b.positions.length});
+
+                for (b.positions.keyframes) |keyframe| {
+                    std.debug.print(" ({d:.3})[{d:.3}, {d:.3}, {d:.3}];", .{keyframe.time, keyframe.value[0], keyframe.value[1], keyframe.value[2]});
+                }
+
+                std.debug.print("\n", .{});
+            }
+
+            if (b.rotations.hasFrames()) {
+                std.debug.print("\trotations ({d:.3}):", .{b.rotations.length});
+
+                for (b.rotations.keyframes) |keyframe| {
+                    std.debug.print(" ({d:.3})[{d:.3}, {d:.3}, {d:.3}, {d:.3}];", .{keyframe.time, keyframe.value[0], keyframe.value[1], keyframe.value[2], keyframe.value[3]});
+                }
+
+                std.debug.print("\n", .{});
+            }
+
+            if (b.scales.hasFrames()) {
+                std.debug.print("\tscales ({d:.3}):", .{b.scales.length});
+
+                for (b.scales.keyframes) |keyframe| {
+                    std.debug.print(" ({d:.3})[{d:.3}, {d:.3}, {d:.3}];", .{keyframe.time, keyframe.value[0], keyframe.value[1], keyframe.value[2]});
+                }
+
+                std.debug.print("\n", .{});
             }
         }
     }
