@@ -32,6 +32,14 @@ const Transform = struct {
     pos: Vec3,
     rot: Quat,
     scl: Vec3,
+
+    fn computeMatrix(self: *const Transform) Mat4 {
+        const pos = zmath.translation(self.pos[0], self.pos[1], self.pos[2]);
+        const rot = zmath.quatToMat(self.rot);
+        const scl = zmath.scaling(self.scl[0], self.scl[1], self.scl[2]);
+
+        return zmath.mul(zmath.mul(pos, rot), scl);
+    }
 };
 
 const Bone = struct {
@@ -86,11 +94,8 @@ const Skeleton = struct {
     fn generateBoneVertices(self: *const Skeleton, output: *std.ArrayList([3]f32), parentMatrix: Mat4, boneIndex: BoneIndex) !void {
         const bone = self.bones[boneIndex];
 
-        const pos = zmath.translation(bone.tran.pos[0], bone.tran.pos[1], bone.tran.pos[2]);
-        const rot = zmath.quatToMat(bone.tran.rot);
-        const scl = zmath.scaling(bone.tran.scl[0], bone.tran.scl[1], bone.tran.scl[2]);
+        const localMatrix = bone.tran.computeMatrix();
 
-        const localMatrix = zmath.mul(zmath.mul(pos, rot), scl);
         const worldMatrix = zmath.mul(parentMatrix, localMatrix);
 
         const worldPos = zmath.mul(zmath.f32x4(0.0, 0.0, 0.0, 1.0), worldMatrix);
@@ -106,14 +111,22 @@ const Skeleton = struct {
 const NodeBoneMap = std.ArrayHashMap(usize, BoneIndex, ZigUtils.Misc.SimpleHashContext, false);
 
 const Animation = struct {
-    bones: [MAX_BONES]?BoneAnimation,
+    bones: [MAX_BONES]?BoneAnimation = [1]?BoneAnimation { null } ** MAX_BONES,
 
     fn getBone(self: *const Animation, boneIndex: BoneIndex) ?*const BoneAnimation {
-        return if (self.bones[boneIndex]) &self.bones[boneIndex] else null;
+        return if (self.bones[boneIndex] != null) &self.bones[boneIndex].? else null;
     }
 
-    fn computeBoneTransform(self: *const Animation, boneIndex: BoneIndex, skeleton: Skeleton, time: f32) !Transform {
-        const base = skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex;
+    fn getOrInitBone(self: *Animation, boneIndex: BoneIndex) *BoneAnimation {
+        if (self.bones[boneIndex] == null) {
+            self.bones[boneIndex] = BoneAnimation {};
+        }
+
+        return &self.bones[boneIndex].?;
+    }
+
+    fn computeBoneTransform(self: *const Animation, skeleton: *const Skeleton, boneIndex: BoneIndex, time: f32) !Transform {
+        var base = (skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex).tran;
 
         if (self.getBone(boneIndex)) |boneAnim| {
             if (boneAnim.getPos(time)) |pos| base.pos = pos;
@@ -123,53 +136,77 @@ const Animation = struct {
 
         return base;
     }
+
+    fn generateBoneVertices(self: *const Animation, skeleton: *const Skeleton, output: *std.ArrayList([3]f32), parentMatrix: Mat4, boneIndex: BoneIndex, time: f32) !void {
+        const tran = try self.computeBoneTransform(skeleton, boneIndex, time);
+
+        const localMatrix = tran.computeMatrix();
+
+        const worldMatrix = zmath.mul(parentMatrix, localMatrix);
+
+        const worldPos = zmath.mul(zmath.f32x4(0.0, 0.0, 0.0, 1.0), worldMatrix);
+
+        try output.append(.{ worldPos[0], worldPos[1], worldPos[2] });
+
+        for (skeleton.bones[boneIndex].children[0..skeleton.bones[boneIndex].num_children]) |childBoneIndex| {
+            try self.generateBoneVertices(skeleton, output, worldMatrix, childBoneIndex, time);
+        }
+    }
 };
 
 const BoneAnimation = struct {
-    positions: Channel(Vec3),
-    rotations: Channel(Quat),
-    scales: Channel(Vec3),
-
-    fn getInterpolation(comptime T: type, comptime method: enum { lerp, slerp }, channel: *const Channel(T), time: f32) T {
-        const relativeTime = channel.computeRelativeTime(time);
-        const a, const b = channel.findKeyframes(relativeTime);
-        const t = (relativeTime - a.time) / (b.time - a.time);
-        return switch (method) {
-            .lerp => zmath.lerp(a.value, b.value, t),
-            .slerp => zmath.slerp(a.value, b.value, t),
-        };
-    }
+    positions: Channel(Vec3) = .{},
+    rotations: Channel(Quat) = .{},
+    scales: Channel(Vec3) = .{},
 
     fn getPos(self: *const BoneAnimation, time: f32) ?Vec3 {
-        return if (self.positions.len == 0) null else getInterpolation(.lerp, self.positions.items, time);
+        return if (self.positions.hasFrames()) self.positions.getInterpolation(.lerp, time) else null;
     }
 
     fn getRot(self: *const BoneAnimation, time: f32) ?Quat {
-        return if (self.rotations.len == 0) null else getInterpolation(.slerp, self.rotations.items, time);
+        return if (self.rotations.hasFrames()) self.rotations.getInterpolation(.slerp, time) else null;
     }
 
     fn getScl(self: *const BoneAnimation, time: f32) ?Vec3 {
-        return if (self.scales.len == 0) null else getInterpolation(.lerp, self.scales.items, time);
+        return if (self.scales.hasFrames()) self.scales.getInterpolation(.lerp, time) else null;
     }
 };
 
 fn Channel (comptime T: type) type {
     return struct {
-        length: f32,
-        keyframes: []Keyframe(T),
+        length: f32 = 0.0,
+        keyframes: []Keyframe(T) = &[0]Keyframe(T) {},
 
         const Self = @This();
+
+        fn init(self: *Self, allocator: std.mem.Allocator, numFrames: usize) !void {
+            self.keyframes = try allocator.alloc(Keyframe(T), numFrames);
+        }
+
+        fn hasFrames(self: *const Self) bool {
+            return self.keyframes.len > 0;
+        }
 
         fn computeRelativeTime(self: *const Self, absoluteTime: f32) f32 {
             return @mod(absoluteTime, self.length);
         }
 
         fn findKeyframes(self: *const Self, relativeTime: f32) struct { *const Keyframe(T), *const Keyframe(T) } {
-            var i = 0;
+            var i: usize = 0;
             while (i < self.keyframes.len) : (i += 1) {
                 if (self.keyframes[i].time >= relativeTime) break;
             }
             return .{ &self.keyframes[i], &self.keyframes[@mod(i + 1, self.keyframes.len)] };
+        }
+
+        fn getInterpolation(self: *const Channel(T), comptime method: enum { lerp, slerp }, time: f32) T {
+            const relativeTime = self.computeRelativeTime(time);
+            const a, const b = self.findKeyframes(relativeTime);
+            const t = (relativeTime - a.time) / (b.time - a.time);
+            return switch (method) {
+                .lerp => zmath.lerp(a.value, b.value, t),
+                .slerp => zmath.slerp(a.value, b.value, t),
+            };
         }
     };
 }
@@ -447,19 +484,24 @@ pub fn main() !void {
 
 
     // load animation data //
-    const animation = gltf.data.animations.items[0];
+    const glAnimation = gltf.data.animations.items[0];
     std.debug.assert(gltf.data.animations.items.len == 1);
 
-    { // samplers
-        const samplers = animation.samplers.items;
+    var animation = Animation {};
 
-        for (samplers, 0..) |sampler, s| {
-            std.debug.print("sampler {}: {}\n", .{s, sampler});
+    { // channels
+        const channels = glAnimation.channels.items;
 
-            std.debug.assert(sampler.interpolation == .linear);
+        for (channels) |channel| {
+            const sampler: zgltf.AnimationSampler = glAnimation.samplers.items[channel.sampler];
 
             const inputAccessor = gltf.data.accessors.items[sampler.input];
             const outputAccessor = gltf.data.accessors.items[sampler.output];
+
+            std.debug.assert(inputAccessor.count == outputAccessor.count);
+
+            const boneIndex = nodeBoneMap.get(channel.target.node) orelse return error.InvalidBoneIndex;
+            const boneAnim = animation.getOrInitBone(boneIndex);
 
             const inputBufferView = gltf.data.buffer_views.items[inputAccessor.buffer_view.?];
             const outputBufferView = gltf.data.buffer_views.items[outputAccessor.buffer_view.?];
@@ -467,24 +509,63 @@ pub fn main() !void {
             var inputIt = IndexedAccessorIterator(f32).init(&gltf, inputAccessor, bufferMap[inputBufferView.buffer]);
             var outputIt = outputAccessor.iterator(f32, &gltf, bufferMap[outputBufferView.buffer]);
 
-            while (inputIt.next()) |x| {
-                const input, const i = x;
+            switch (channel.target.property) {
+                .translation => {
+                    std.debug.assert(!boneAnim.positions.hasFrames());
 
-                const output = outputIt.next() orelse return error.MissingOutput;
+                    try boneAnim.positions.init(allocator, @intCast(inputAccessor.count));
 
-                std.debug.print("\tindex {}\n", .{i});
-                std.debug.print("\t\tinput: {any}\n", .{input});
-                std.debug.print("\t\toutput: {any}\n", .{output});
+                    while (inputIt.next()) |x| {
+                        const input, const i = x;
+
+                        const output = outputIt.next() orelse return error.MissingOutput;
+
+                        boneAnim.positions.length = @max(boneAnim.positions.length, input[0]);
+
+                        boneAnim.positions.keyframes[i] = .{
+                            .time = input[0],
+                            .value = .{ output[0], output[1], output[2] },
+                        };
+                    }
+                },
+                .rotation => {
+                    std.debug.assert(!boneAnim.rotations.hasFrames());
+
+                    try boneAnim.rotations.init(allocator, @intCast(inputAccessor.count));
+
+                    while (inputIt.next()) |x| {
+                        const input, const i = x;
+
+                        const output = outputIt.next() orelse return error.MissingOutput;
+
+                        boneAnim.rotations.length = @max(boneAnim.rotations.length, input[0]);
+
+                        boneAnim.rotations.keyframes[i] = .{
+                            .time = input[0],
+                            .value = .{ output[0], output[1], output[2], output[3] },
+                        };
+                    }
+                },
+                .scale => {
+                    std.debug.assert(!boneAnim.scales.hasFrames());
+
+                    try boneAnim.scales.init(allocator, @intCast(inputAccessor.count));
+
+                    while (inputIt.next()) |x| {
+                        const input, const i = x;
+
+                        const output = outputIt.next() orelse return error.MissingOutput;
+
+                        boneAnim.scales.length = @max(boneAnim.scales.length, input[0]);
+
+                        boneAnim.scales.keyframes[i] = .{
+                            .time = input[0],
+                            .value = .{ output[0], output[1], output[2] },
+                        };
+                    }
+                },
+                else => std.debug.print("Unhandled channel property: {s}\n", .{@tagName(channel.target.property)}),
             }
-        }
-    }
-
-
-    { // channels
-        const channels = animation.channels.items;
-
-        for (channels, 0..) |channel, c| {
-            std.debug.print("channel {}: {}\n", .{c, channel});
         }
     }
 
@@ -581,10 +662,10 @@ pub fn main() !void {
     }
 
     const skinVao = zgl.createVertexArray();
+    const skinVbo = zgl.createBuffer();
     {
-        const vbo = zgl.createBuffer();
-        skinVao.vertexBuffer(0, vbo, 0, @sizeOf(Vertex.Pos));
-        vbo.data(Vertex.Pos, skinVertices.items, .static_draw);
+        skinVao.vertexBuffer(0, skinVbo, 0, @sizeOf(Vertex.Pos));
+        skinVbo.data(Vertex.Pos, skinVertices.items, .dynamic_draw);
 
         skinVao.attribFormat(0, 3, .float, false, 0);
         skinVao.attribBinding(0, 0);
@@ -607,6 +688,8 @@ pub fn main() !void {
     shaderProgram.uniformMatrix4(uniforms.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
     shaderProgram.uniformMatrix4(uniforms.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
 
+    var runTimer = try std.time.Timer.start();
+    // var frameTimer = try std.time.Timer.start();
 
     // run //
     mainLoop: while (true) {
@@ -616,6 +699,16 @@ pub fn main() !void {
                 else => {},
             }
         }
+
+        const runNs = runTimer.read();
+        const runTime = @as(f32, @floatFromInt(runNs)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+        // const deltaNs = frameTimer.lap();
+        // var deltaTime = @as(f32, @floatFromInt(deltaNs)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+
+        skinVertices.clearRetainingCapacity();
+        try animation.generateBoneVertices(&skeleton, &skinVertices, zmath.identity(), 0, runTime);
+
+        skinVbo.subData(0, Vertex.Pos, skinVertices.items);
 
         zgl.clearColor(0.0, 0.0, 0.0, 1.0);
         zgl.clear(.{ .color = true, .depth = true });
