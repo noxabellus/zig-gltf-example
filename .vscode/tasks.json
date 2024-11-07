@@ -15,11 +15,21 @@
         {
             "label": "run",
             "type": "shell",
-            "command": "zig build run -freference-trace --prominent-compile-errors",
+            "command": "exec -a vscode-run-task zig build run -freference-trace --prominent-compile-errors",
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
+            "dependsOn": ["kill-run"],
+            "dependsOrder": "sequence",
+            "runOptions": {
+                "instanceLimit": 999
+            }
+        },
+        {
+            "label": "kill-run",
+            "type": "shell",
+            "command": "pkill -KILL -f vscode-run-task && exit 0"
         },
         {
             "label": "test",

@@ -1,3 +1,15 @@
+// config //
+const WINDOW_WIDTH = 1024;
+const WINDOW_HEIGHT = 768;
+const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
+const USE_WIREFRAME = false;
+const RENDER_BONE_POSITIONS = false;
+const COLOR = .{ 0.761, 0.506, 0.184 };
+const MESH_FRAGMENT: enum { basic, visualize_weights, lit } = .lit;
+const EXAMPLE: enum { khronos, rigged_simple } = .rigged_simple;
+
+
+// imports //
 const std = @import("std");
 const math = std.math;
 const zgl = @import("zgl");
@@ -6,22 +18,54 @@ const zmath = @import("zmath");
 const ZigUtils = @import("ZigUtils");
 const sdl = @import("sdl");
 
-const Mat4 = zmath.Mat4;
-const Vec4 = zmath.Vec4;
-const Quat = zmath.Quat;
-const Vec3 = @Vector(3, f32);
 
-const WINDOW_WIDTH = 430;
-const WINDOW_HEIGHT = 320;
-const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
-const VISUALIZE_WEIGHTS = false;
-const USE_WIREFRAME = false;
-const RENDER_BONE_POSITIONS = false;
+// example data //
+const NUM_EXAMPLES = std.meta.fields(@TypeOf(EXAMPLE)).len;
+
+const FOLDERS = [NUM_EXAMPLES][]const u8 {
+    "khronos",
+    "rigged_simple",
+};
+
+const ROOT_FILES = [NUM_EXAMPLES][]const u8 {
+    "khronos.gltf",
+    "RiggedSimple.gltf",
+};
+
+var VIEWS = [NUM_EXAMPLES]Mat4 {
+    zmath.lookAtLh(
+        zmath.f32x4(0.0, 1.0, -6.0, 1.0), // eye position
+        zmath.f32x4(0.0, 1.0,  0.0, 1.0), // focus point
+        zmath.f32x4(0.0, 1.0,  0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
+    ),
+    zmath.lookAtLh(
+        zmath.f32x4(20.0, 0.0, 5.0, 1.0),
+        zmath.f32x4( 0.0, 0.0, 5.0, 1.0),
+        zmath.f32x4( 0.0, 0.0, 1.0, 0.0),
+    ),
+};
+
+var LIGHT_DIRS = [NUM_EXAMPLES]Vec3Arr {
+    .{0.0, 0.0, 1.0},
+    .{-20.0, 20.0, 10.0},
+};
+
+
+// types //
+const Mat4 = zmath.Mat4;
+const Mat4Arr = [4][4]f32;
+const Vec4 = zmath.Vec4;
+const Vec4Arr = [4]f32;
+const Quat = zmath.Quat;
+const QuatArr = [4]f32;
+const Vec3 = @Vector(3, f32);
+const Vec3Arr = [3]f32;
 
 const Vertex = extern struct {
-    pos: Pos,
-    joints: Joints,
-    weights: Weights,
+    pos: Pos = .{0.0, 0.0, 0.0},
+    normal: Normal = .{0.0, 0.0, 0.0},
+    weights: Weights = .{0.0, 0.0, 0.0, 0.0},
+    joints: Joints = .{0, 0, 0, 0},
 
     pub const Pos = [3]f32;
     pub const Normal = [3]f32;
@@ -257,6 +301,28 @@ fn Keyframe (comptime T: type) type {
     };
 }
 
+fn computeNormals(vertices: []Vertex, indices: []const u16, indexOffset: u16) void {
+    for (vertices) |*vert| vert.normal = .{0.0, 0.0, 0.0};
+
+    for (0..indices.len / 3) |i| {
+        const x0 = indices[i * 3 + 0] - indexOffset;
+        const x1 = indices[i * 3 + 1] - indexOffset;
+        const x2 = indices[i * 3 + 2] - indexOffset;
+
+        const v0 = zmath.loadArr3w(vertices[x0].pos, 1.0);
+        const v1 = zmath.loadArr3w(vertices[x1].pos, 1.0);
+        const v2 = zmath.loadArr3w(vertices[x2].pos, 1.0);
+
+        const n = zmath.normalize3(zmath.cross3(v1 - v0, v2 - v0));
+
+        vertices[x0].normal = zmath.vecToArr3(zmath.loadArr3(vertices[x0].normal) + n);
+        vertices[x1].normal = zmath.vecToArr3(zmath.loadArr3(vertices[x1].normal) + n);
+        vertices[x2].normal = zmath.vecToArr3(zmath.loadArr3(vertices[x2].normal) + n);
+    }
+
+    for (vertices) |*vert| vert.normal = zmath.vecToArr3(zmath.normalize3(zmath.loadArr3(vert.normal)));
+}
+
 
 pub fn main() !void {
     var samplesDir = try std.fs.cwd().openDir("test-samples", .{});
@@ -300,12 +366,12 @@ pub fn main() !void {
 
 
     // load model file //
-    var modelDir = try samplesDir.openDir("khronos", .{});
+    var modelDir = try samplesDir.openDir(FOLDERS[@intFromEnum(EXAMPLE)], .{});
     defer modelDir.close();
 
     const gltfJSON = try modelDir.readFileAllocOptions(
         allocator,
-        "khronos.gltf",
+        ROOT_FILES[@intFromEnum(EXAMPLE)],
         512_000,
         null,
         4,
@@ -433,25 +499,28 @@ pub fn main() !void {
     std.debug.assert(gltf.data.meshes.items.len == 1);
 
     for (mesh.primitives.items) |primitive| {
-        {
-            const indicesAccessor = gltf.data.accessors.items[primitive.indices.?];
+        const indicesAccessor = gltf.data.accessors.items[primitive.indices.?];
 
-            const bufferView = gltf.data.buffer_views.items[indicesAccessor.buffer_view.?];
+        const indexBufferView = gltf.data.buffer_views.items[indicesAccessor.buffer_view.?];
 
-            const indicesView = try indices.addManyAt(indices.items.len, @intCast(indicesAccessor.count));
+        const indexOffset: u16 = @intCast(indices.items.len);
+        const indicesView = try indices.addManyAt(indices.items.len, @intCast(indicesAccessor.count));
 
-            var it = IndexedAccessorIterator(u16).init(&gltf, indicesAccessor, bufferMap[bufferView.buffer]);
-            while (it.next()) |x| {
-                const k, const i = x;
-                indicesView[i] = k[0];
-            }
+        var indexIt = IndexedAccessorIterator(u16).init(&gltf, indicesAccessor, bufferMap[indexBufferView.buffer]);
+        while (indexIt.next()) |x| {
+            const k, const i = x;
+            indicesView[i] = k[0] + indexOffset;
         }
 
         const verticesView = view: {
             const firstAccessor = gltf.data.accessors.items[extractAttributeIndex(primitive.attributes.items[0])];
+            const view = try vertices.addManyAt(vertices.items.len, @intCast(firstAccessor.count));
 
-            break :view try vertices.addManyAt(vertices.items.len, @intCast(firstAccessor.count));
+            // for (view) |*vert| vert.* = Vertex {};
+            break :view view;
         };
+
+        var haveNormals = false;
 
         for (primitive.attributes.items) |attribute| {
             switch (attribute) {
@@ -469,20 +538,21 @@ pub fn main() !void {
                         verticesView[i].pos = .{ v[0], v[1], v[2] };
                     }
                 },
-                .normal => |_| {
-                    continue;
-                    // const accessor = gltf.data.accessors.items[idx];
+                .normal => |idx| {
+                    const accessor = gltf.data.accessors.items[idx];
 
-                    // std.debug.assert(accessor.count == verticesView.len);
-                    // std.debug.assert(accessor.component_type == .float);
+                    std.debug.assert(accessor.count == verticesView.len);
+                    std.debug.assert(accessor.component_type == .float);
 
-                    // const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+                    const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
 
-                    // var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
-                    // while (it.next()) |x| {
-                    //     const n, const i = x;
-                    //     verticesView[i].normal = .{ n[0], n[1], n[2] };
-                    // }
+                    var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                    while (it.next()) |x| {
+                        const n, const i = x;
+                        verticesView[i].normal = .{ n[0], n[1], n[2] };
+                    }
+
+                    haveNormals = true;
                 },
                 .joints => |idx| {
                     const accessor = gltf.data.accessors.items[idx];
@@ -523,28 +593,33 @@ pub fn main() !void {
                 },
             }
         }
+
+        if (!haveNormals) {
+            std.debug.print("Note: Mesh file does not contain normals, computing them instead", .{});
+            computeNormals(verticesView, indicesView, indexOffset);
+        }
     }
 
-
-    std.debug.print("Vertices count: {}\n", .{vertices.items.len});
-    for (vertices.items, 0..) |vert, i| {
-        std.debug.print(
-            \\{}:
-            \\  Pos: [{d:.3}, {d:.3}, {d:.3}]
-            //\\  Normal: [{d:.3}, {d:.3}, {d:.3}]
-            \\  Joints: [{}, {}, {}, {}]
-            \\  Weights: [{d:.3}, {d:.3}, {d:.3}, {d:.3}]
-            \\
-            , .{
-                i,
-                vert.pos[0], vert.pos[1], vert.pos[2],
-                // vert.normal[0], vert.normal[1], vert.normal[2],
-                vert.joints[0], vert.joints[1], vert.joints[2], vert.joints[3],
-                vert.weights[0], vert.weights[1], vert.weights[2], vert.weights[3],
-            }
-        );
-    }
-    std.debug.print("Indices count: {}\n", .{indices.items.len});
+    // print mesh data
+    // std.debug.print("Vertices count: {}\n", .{vertices.items.len});
+    // for (vertices.items, 0..) |vert, i| {
+    //     std.debug.print(
+    //         \\{}:
+    //         \\  Pos: [{d:.3}, {d:.3}, {d:.3}]
+    //         \\  Normal: [{d:.3}, {d:.3}, {d:.3}]
+    //         \\  Joints: [{}, {}, {}, {}]
+    //         \\  Weights: [{d:.3}, {d:.3}, {d:.3}, {d:.3}]
+    //         \\
+    //         , .{
+    //             i,
+    //             vert.pos[0], vert.pos[1], vert.pos[2],
+    //             vert.normal[0], vert.normal[1], vert.normal[2],
+    //             vert.joints[0], vert.joints[1], vert.joints[2], vert.joints[3],
+    //             vert.weights[0], vert.weights[1], vert.weights[2], vert.weights[3],
+    //         }
+    //     );
+    // }
+    // std.debug.print("Indices count: {}\n", .{indices.items.len});
 
 
     // load animation data //
@@ -679,20 +754,23 @@ pub fn main() !void {
     const basicVertexSource = try shaderDir.readFileAlloc(allocator, "basic.vert", math.maxInt(u16));
     defer allocator.free(basicVertexSource);
 
-    const meshVertexSource = try shaderDir.readFileAlloc(allocator, "skin.vert", math.maxInt(u16));
-    defer allocator.free(meshVertexSource);
+    const skinVertexSource = try shaderDir.readFileAlloc(allocator, "skin.vert", math.maxInt(u16));
+    defer allocator.free(skinVertexSource);
 
     const basicFragmentSource = try shaderDir.readFileAlloc(allocator, "basic.frag", math.maxInt(u16));
     defer allocator.free(basicFragmentSource);
 
-    const meshFragmentSource = try shaderDir.readFileAlloc(allocator, "skin.frag", math.maxInt(u16));
-    defer allocator.free(meshFragmentSource);
+    const skinFragmentSource = try shaderDir.readFileAlloc(allocator, "skin.frag", math.maxInt(u16));
+    defer allocator.free(skinFragmentSource);
+
+    const litFragmentSource = try shaderDir.readFileAlloc(allocator, "lit.frag", math.maxInt(u16));
+    defer allocator.free(litFragmentSource);
 
     // print shader sources
     // std.debug.print("loaded vert src: ```\n{s}\n```\n", .{basicVertexSource});
-    // std.debug.print("loaded vert src: ```\n{s}\n```\n", .{meshVertexSource});
+    // std.debug.print("loaded vert src: ```\n{s}\n```\n", .{skinVertexSource});
     // std.debug.print("loaded frag src: ```\n{s}\n```\n", .{basicFragmentSource});
-    // std.debug.print("loaded frag src: ```\n{s}\n```\n", .{meshFragmentSource});
+    // std.debug.print("loaded frag src: ```\n{s}\n```\n", .{skinFragmentSource});
 
     const basicVertexShader = zgl.createShader(.vertex);
     basicVertexShader.source(1, &[1][]const u8 { basicVertexSource });
@@ -708,13 +786,13 @@ pub fn main() !void {
         return error.ShaderCompilationFailed;
     }
 
-    const meshVertexShader = zgl.createShader(.vertex);
-    meshVertexShader.source(1, &[1][]const u8 { meshVertexSource });
-    meshVertexShader.compile();
-    defer meshVertexShader.delete();
+    const skinVertexShader = zgl.createShader(.vertex);
+    skinVertexShader.source(1, &[1][]const u8 { skinVertexSource });
+    skinVertexShader.compile();
+    defer skinVertexShader.delete();
 
-    if (meshVertexShader.get(.compile_status) == 0) {
-        const info = try meshVertexShader.getCompileLog(allocator);
+    if (skinVertexShader.get(.compile_status) == 0) {
+        const info = try skinVertexShader.getCompileLog(allocator);
         defer allocator.free(info);
 
         std.debug.print("Mesh vertex shader info log: ```\n{s}\n```\n", .{info});
@@ -736,13 +814,27 @@ pub fn main() !void {
         return error.ShaderCompilationFailed;
     }
 
-    const meshFragmentShader = zgl.createShader(.fragment);
-    meshFragmentShader.source(1, &[1][]const u8 { meshFragmentSource });
-    meshFragmentShader.compile();
-    defer meshFragmentShader.delete();
+    const skinFragmentShader = zgl.createShader(.fragment);
+    skinFragmentShader.source(1, &[1][]const u8 { skinFragmentSource });
+    skinFragmentShader.compile();
+    defer skinFragmentShader.delete();
 
-    if (meshFragmentShader.get(.compile_status) == 0) {
-        const info = try meshFragmentShader.getCompileLog(allocator);
+    if (skinFragmentShader.get(.compile_status) == 0) {
+        const info = try skinFragmentShader.getCompileLog(allocator);
+        defer allocator.free(info);
+
+        std.debug.print("Fragment shader info log: ```\n{s}\n```\n", .{info});
+
+        return error.ShaderCompilationFailed;
+    }
+
+    const litFragmentShader = zgl.createShader(.fragment);
+    litFragmentShader.source(1, &[1][]const u8 { litFragmentSource });
+    litFragmentShader.compile();
+    defer litFragmentShader.delete();
+
+    if (litFragmentShader.get(.compile_status) == 0) {
+        const info = try litFragmentShader.getCompileLog(allocator);
         defer allocator.free(info);
 
         std.debug.print("Fragment shader info log: ```\n{s}\n```\n", .{info});
@@ -773,8 +865,8 @@ pub fn main() !void {
     };
 
     const meshShaderProgram = zgl.createProgram();
-    meshShaderProgram.attach(meshVertexShader);
-    meshShaderProgram.attach(if (VISUALIZE_WEIGHTS) meshFragmentShader else basicFragmentShader);
+    meshShaderProgram.attach(skinVertexShader);
+    meshShaderProgram.attach(switch (MESH_FRAGMENT) { .visualize_weights => skinFragmentShader, .basic => basicFragmentShader, .lit => litFragmentShader });
     meshShaderProgram.link();
     defer meshShaderProgram.delete();
 
@@ -793,6 +885,7 @@ pub fn main() !void {
         .projection = meshShaderProgram.uniformLocation("projection") orelse return error.MissingUniform,
         .skinMatrices = meshShaderProgram.uniformLocation("skinMatrices") orelse return error.MissingUniform,
         .color = meshShaderProgram.uniformLocation("color"),
+        .lightDir = meshShaderProgram.uniformLocation("lightDir"),
     };
 
 
@@ -812,15 +905,23 @@ pub fn main() !void {
         meshVao.attribBinding(aPosLoc, 0);
         meshVao.enableVertexAttribute(aPosLoc);
 
-        const aJointsLoc = zgl.getAttribLocation(meshShaderProgram, "aJoints") orelse return error.MissingAttribute;
-        meshVao.attribIFormat(aJointsLoc, componentCount(Vertex.Joints), nativeToGlType(componentType(Vertex.Joints)), @offsetOf(Vertex, "joints"));
-        meshVao.attribBinding(aJointsLoc, 0);
-        meshVao.enableVertexAttribute(aJointsLoc);
+        if (zgl.getAttribLocation(meshShaderProgram, "aNormal")) |aNormalLoc| {
+            meshVao.attribFormat(aNormalLoc, componentCount(Vertex.Normal), nativeToGlType(componentType(Vertex.Normal)), true, @offsetOf(Vertex, "normal"));
+            meshVao.attribBinding(aNormalLoc, 0);
+            meshVao.enableVertexAttribute(aNormalLoc);
+        } else {
+            std.debug.print("Note: no aNormal attribute in shader program; skipping", .{});
+        }
 
         const aWeightsLoc = zgl.getAttribLocation(meshShaderProgram, "aWeights") orelse return error.MissingAttribute;
         meshVao.attribFormat(aWeightsLoc, componentCount(Vertex.Weights), nativeToGlType(componentType(Vertex.Weights)), true, @offsetOf(Vertex, "weights"));
         meshVao.attribBinding(aWeightsLoc, 0);
         meshVao.enableVertexAttribute(aWeightsLoc);
+
+        const aJointsLoc = zgl.getAttribLocation(meshShaderProgram, "aJoints") orelse return error.MissingAttribute;
+        meshVao.attribIFormat(aJointsLoc, componentCount(Vertex.Joints), nativeToGlType(componentType(Vertex.Joints)), @offsetOf(Vertex, "joints"));
+        meshVao.attribBinding(aJointsLoc, 0);
+        meshVao.enableVertexAttribute(aJointsLoc);
     }
 
 
@@ -853,31 +954,44 @@ pub fn main() !void {
     // init matrix data //
     const matrices = .{
         .model = zmath.identity(),
-        .view = zmath.lookAtLh(
-            zmath.f32x4(0.0, 1.0, -6.0, 1.0), // eye position
-            zmath.f32x4(0.0, 1.0, 0.0, 1.0), // focus point
-            zmath.f32x4(0.0, 1.0, 0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
-        ),
-        .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 20.0),
+        .view = VIEWS[@intFromEnum(EXAMPLE)],
+        .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 100.0),
     };
 
 
     // init uniforms //
 
-    basicShaderProgram.uniformMatrix4(basicUniforms.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
-    basicShaderProgram.uniformMatrix4(basicUniforms.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
-    basicShaderProgram.uniformMatrix4(basicUniforms.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
+    basicShaderProgram.uniformMatrix4(basicUniforms.model, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
+    basicShaderProgram.uniformMatrix4(basicUniforms.view, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
+    basicShaderProgram.uniformMatrix4(basicUniforms.projection, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
     basicShaderProgram.uniform3f(basicUniforms.color, 1.0, 1.0, 1.0);
 
-    meshShaderProgram.uniformMatrix4(meshUniforms.model, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
-    meshShaderProgram.uniformMatrix4(meshUniforms.view, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
-    meshShaderProgram.uniformMatrix4(meshUniforms.projection, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
-    meshShaderProgram.uniformMatrix4(meshUniforms.skinMatrices, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(skinMatrices.items)))[0..skinMatrices.items.len]);
-    if (meshUniforms.color) |loc| meshShaderProgram.uniform3f(loc, 0.761, 0.506, 0.184);
+    meshShaderProgram.uniformMatrix4(meshUniforms.model, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
+    meshShaderProgram.uniformMatrix4(meshUniforms.view, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
+    meshShaderProgram.uniformMatrix4(meshUniforms.projection, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
+    meshShaderProgram.uniformMatrix4(meshUniforms.skinMatrices, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(skinMatrices.items)))[0..skinMatrices.items.len]);
+    if (meshUniforms.color) |loc| meshShaderProgram.uniform3f(loc, COLOR[0], COLOR[1], COLOR[2]);
+    if (meshUniforms.lightDir) |loc| {
+        const lightDir = LIGHT_DIRS[@intFromEnum(EXAMPLE)];
+        meshShaderProgram.uniform3f(loc, lightDir[0], lightDir[1], lightDir[2]);
+    }
 
 
     var runTimer = try std.time.Timer.start();
     // var frameTimer = try std.time.Timer.start();
+
+
+    // rendering basics //
+    zgl.clearColor(0.0, 0.0, 0.0, 1.0);
+
+    zgl.pointSize(10.0);
+    if (USE_WIREFRAME) {
+        zgl.polygonMode(.front_and_back, .line);
+    } else {
+        zgl.enable(.cull_face);
+        zgl.frontFace(.ccw);
+    }
+
 
     // run //
     mainLoop: while (true) {
@@ -902,13 +1016,7 @@ pub fn main() !void {
         // std.debug.print("transferring skin matrices: {any}\n", .{skinMatrices.items});
         meshShaderProgram.uniformMatrix4(meshUniforms.skinMatrices, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(skinMatrices.items.ptr)))[0..skinMatrices.items.len]);
 
-
-        zgl.clearColor(0.0, 0.0, 0.0, 1.0);
         zgl.clear(.{ .color = true, .depth = true });
-
-
-        zgl.pointSize(10.0);
-        zgl.polygonMode(.front_and_back, if (USE_WIREFRAME) .line else .fill);
 
         meshShaderProgram.use();
         meshVao.bind();
