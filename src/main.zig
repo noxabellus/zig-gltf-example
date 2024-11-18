@@ -3,10 +3,12 @@ const WINDOW_WIDTH = 1024;
 const WINDOW_HEIGHT = 768;
 const ASPECT_RATIO = @as(f32, WINDOW_WIDTH) / @as(f32, WINDOW_HEIGHT);
 const USE_WIREFRAME = false;
-const RENDER_BONE_POSITIONS = false;
+const RENDER_BONE_POSITIONS = true;
 const COLOR = .{ 0.761, 0.506, 0.184 };
-const MESH_FRAGMENT: enum { basic, visualize_weights, lit } = .lit;
-const EXAMPLE: enum { khronos, rigged_simple } = .rigged_simple;
+const MESH_VERTEX: enum { basic, skin } = .skin;
+const MESH_FRAGMENT: enum { basic, visualize_weights, lit } = .basic;
+const EXAMPLE: enum { khronos, mixamo, rigged_simple } = .mixamo;
+const ANIMATION_INDEX = 0;
 
 
 // imports //
@@ -24,11 +26,13 @@ const NUM_EXAMPLES = std.meta.fields(@TypeOf(EXAMPLE)).len;
 
 const FOLDERS = [NUM_EXAMPLES][]const u8 {
     "khronos",
+    "mixamo",
     "rigged_simple",
 };
 
 const ROOT_FILES = [NUM_EXAMPLES][]const u8 {
     "khronos.gltf",
+    "mixamo.gltf",
     "RiggedSimple.gltf",
 };
 
@@ -39,13 +43,25 @@ var VIEWS = [NUM_EXAMPLES]Mat4 {
         zmath.f32x4(0.0, 1.0,  0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
     ),
     zmath.lookAtLh(
+        zmath.f32x4(0.0, 1.0, -500.0, 1.0), // eye position
+        zmath.f32x4(0.0, 1.0,    0.0, 1.0), // focus point
+        zmath.f32x4(0.0, 1.0,    0.0, 0.0), // up direction ('w' coord is zero because this is a vector not a point)
+    ),
+    zmath.lookAtLh(
         zmath.f32x4(20.0, 0.0, 5.0, 1.0),
         zmath.f32x4( 0.0, 0.0, 5.0, 1.0),
         zmath.f32x4( 0.0, 0.0, 1.0, 0.0),
     ),
 };
 
+var CLIP_PLANES = [NUM_EXAMPLES]f32 {
+    100.0,
+    5000.0,
+    100.0,
+};
+
 var LIGHT_DIRS = [NUM_EXAMPLES]Vec3Arr {
+    .{0.0, 0.0, 1.0},
     .{0.0, 0.0, 1.0},
     .{-20.0, 20.0, 10.0},
 };
@@ -60,14 +76,17 @@ const Quat = zmath.Quat;
 const QuatArr = [4]f32;
 const Vec3 = @Vector(3, f32);
 const Vec3Arr = [3]f32;
+const Index = u32;
 
 const Vertex = extern struct {
     pos: Pos = .{0.0, 0.0, 0.0},
+    texcoord: Texcoord = .{0.0, 0.0},
     normal: Normal = .{0.0, 0.0, 0.0},
     weights: Weights = .{0.0, 0.0, 0.0, 0.0},
     joints: Joints = .{0, 0, 0, 0},
 
     pub const Pos = [3]f32;
+    pub const Texcoord = [2]f32;
     pub const Normal = [3]f32;
     pub const Weights = [4]f32;
     pub const Joints = [4]BoneIndex;
@@ -175,14 +194,14 @@ const Animation = struct {
         return &self.bones[boneIndex].?;
     }
 
-    fn computeBoneTransform(self: *const Animation, skeleton: *const Skeleton, boneIndex: BoneIndex, time: f32) !Transform {
-        var base = (skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex).tran;
+    fn computeBoneTransform(_: *const Animation, skeleton: *const Skeleton, boneIndex: BoneIndex, _: f32) !Transform {
+        const base = (skeleton.getBone(boneIndex) orelse return error.InvalidBoneIndex).tran;
 
-        if (self.getBone(boneIndex)) |boneAnim| {
-            if (boneAnim.getPos(time)) |pos| base.pos = pos;
-            if (boneAnim.getRot(time)) |rot| base.rot = rot;
-            if (boneAnim.getScl(time)) |scl| base.scl = scl;
-        }
+        // if (self.getBone(boneIndex)) |boneAnim| {
+        //     if (boneAnim.getPos(time)) |pos| base.pos = pos;
+        //     if (boneAnim.getRot(time)) |rot| base.rot = rot;
+        //     if (boneAnim.getScl(time)) |scl| base.scl = scl;
+        // }
 
         return base;
     }
@@ -301,7 +320,7 @@ fn Keyframe (comptime T: type) type {
     };
 }
 
-fn computeNormals(vertices: []Vertex, indices: []const u16, indexOffset: u16) void {
+fn computeNormals(vertices: []Vertex, indices: []const Index, indexOffset: Index) void {
     for (vertices) |*vert| vert.normal = .{0.0, 0.0, 0.0};
 
     for (0..indices.len / 3) |i| {
@@ -492,111 +511,156 @@ pub fn main() !void {
     var vertices = std.ArrayList(Vertex).init(allocator);
     defer vertices.deinit();
 
-    var indices = std.ArrayList(u16).init(allocator);
+    var indices = std.ArrayList(Index).init(allocator);
     defer indices.deinit();
 
     const mesh = gltf.data.meshes.items[0];
-    std.debug.assert(gltf.data.meshes.items.len == 1);
-
-    for (mesh.primitives.items) |primitive| {
-        const indicesAccessor = gltf.data.accessors.items[primitive.indices.?];
-
-        const indexBufferView = gltf.data.buffer_views.items[indicesAccessor.buffer_view.?];
-
-        const indexOffset: u16 = @intCast(indices.items.len);
-        const indicesView = try indices.addManyAt(indices.items.len, @intCast(indicesAccessor.count));
-
-        var indexIt = IndexedAccessorIterator(u16).init(&gltf, indicesAccessor, bufferMap[indexBufferView.buffer]);
-        while (indexIt.next()) |x| {
-            const k, const i = x;
-            indicesView[i] = k[0] + indexOffset;
+    if (gltf.data.meshes.items.len != 1) {
+        std.debug.print("NOTE: Only mesh {} (of {}) will be loaded\n", .{0, gltf.data.meshes.items.len});
+    }
+    // for (gltf.data.meshes.items) |mesh|
+    {
+        if (mesh.primitives.items.len != 1) {
+            std.debug.print("NOTE: {} primitives will be loaded\n", .{mesh.primitives.items.len});
         }
 
-        const verticesView = view: {
-            const firstAccessor = gltf.data.accessors.items[extractAttributeIndex(primitive.attributes.items[0])];
-            const view = try vertices.addManyAt(vertices.items.len, @intCast(firstAccessor.count));
+        for (mesh.primitives.items) |primitive| {
+            const indicesAccessor = gltf.data.accessors.items[primitive.indices.?];
 
-            // for (view) |*vert| vert.* = Vertex {};
-            break :view view;
-        };
+            std.debug.assert(indicesAccessor.component_type == .unsigned_short);
 
-        var haveNormals = false;
+            const indexBufferView = gltf.data.buffer_views.items[indicesAccessor.buffer_view.?];
 
-        for (primitive.attributes.items) |attribute| {
-            switch (attribute) {
-                .position => |idx| {
-                    const accessor = gltf.data.accessors.items[idx];
+            const indexOffset: Index = @intCast(vertices.items.len);
+            std.debug.print("indices for this primitive will be offset by {}\n", .{indexOffset});
+            const indicesView = try indices.addManyAt(indices.items.len, @intCast(indicesAccessor.count));
 
-                    std.debug.assert(accessor.count == verticesView.len);
-                    std.debug.assert(accessor.component_type == .float);
 
-                    const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
-
-                    var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
-                    while (it.next()) |x| {
-                        const v, const i = x;
-                        verticesView[i].pos = .{ v[0], v[1], v[2] };
-                    }
-                },
-                .normal => |idx| {
-                    const accessor = gltf.data.accessors.items[idx];
-
-                    std.debug.assert(accessor.count == verticesView.len);
-                    std.debug.assert(accessor.component_type == .float);
-
-                    const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
-
-                    var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
-                    while (it.next()) |x| {
-                        const n, const i = x;
-                        verticesView[i].normal = .{ n[0], n[1], n[2] };
-                    }
-
-                    haveNormals = true;
-                },
-                .joints => |idx| {
-                    const accessor = gltf.data.accessors.items[idx];
-
-                    std.debug.assert(accessor.count == verticesView.len);
-                    std.debug.assert(accessor.component_type == .unsigned_short);
-
-                    const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
-
-                    var it = IndexedAccessorIterator(u16).init(&gltf, accessor, bufferMap[bufferView.buffer]);
-                    while (it.next()) |x| {
-                        const j, const i = x;
-                        verticesView[i].joints = .{
-                            nodeBoneMap.get(skin.joints.items[j[0]]) orelse return error.InvalidJointIndex,
-                            nodeBoneMap.get(skin.joints.items[j[1]]) orelse return error.InvalidJointIndex,
-                            nodeBoneMap.get(skin.joints.items[j[2]]) orelse return error.InvalidJointIndex,
-                            nodeBoneMap.get(skin.joints.items[j[3]]) orelse return error.InvalidJointIndex,
-                        };
-                    }
-                },
-                .weights => |idx| {
-                    const accessor = gltf.data.accessors.items[idx];
-
-                    std.debug.assert(accessor.count == verticesView.len);
-                    std.debug.assert(accessor.component_type == .float);
-
-                    const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
-
-                    var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
-                    while (it.next()) |x| {
-                        const w, const i = x;
-                        std.debug.assert(std.math.approxEqAbs(f32, w[0] + w[1] + w[2] + w[3], 1.0, std.math.floatEps(f32)));
-                        verticesView[i].weights = .{ w[0], w[1], w[2], w[3] };
-                    }
-                },
-                else => {
-                    std.debug.print("Unhandled attribute: {}\n", .{attribute});
-                },
+            var indexIt = IndexedAccessorIterator(u16).init(&gltf, indicesAccessor, bufferMap[indexBufferView.buffer]);
+            while (indexIt.next()) |x| {
+                const k, const i = x;
+                indicesView[i] = k[0] + indexOffset;
             }
-        }
 
-        if (!haveNormals) {
-            std.debug.print("Note: Mesh file does not contain normals, computing them instead", .{});
-            computeNormals(verticesView, indicesView, indexOffset);
+            const verticesView = view: {
+                const firstAccessor = gltf.data.accessors.items[extractAttributeIndex(primitive.attributes.items[0])];
+                const view = try vertices.addManyAt(vertices.items.len, @intCast(firstAccessor.count));
+
+                // for (view) |*vert| vert.* = Vertex {};
+                break :view view;
+            };
+
+            var haveNormals = false;
+
+            for (primitive.attributes.items) |attribute| {
+                switch (attribute) {
+                    .position => |idx| {
+                        const accessor = gltf.data.accessors.items[idx];
+
+                        std.debug.assert(accessor.count == verticesView.len);
+                        std.debug.assert(accessor.component_type == .float);
+
+                        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+                        var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                        while (it.next()) |x| {
+                            const v, const i = x;
+                            verticesView[i].pos = .{ v[0], v[1], v[2] };
+                        }
+                    },
+                    .normal => |idx| {
+                        const accessor = gltf.data.accessors.items[idx];
+
+                        std.debug.assert(accessor.count == verticesView.len);
+                        std.debug.assert(accessor.component_type == .float);
+
+                        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+                        var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                        while (it.next()) |x| {
+                            const n, const i = x;
+                            verticesView[i].normal = .{ n[0], n[1], n[2] };
+                        }
+
+                        haveNormals = true;
+                    },
+                    .joints => |idx| {
+                        const accessor = gltf.data.accessors.items[idx];
+
+                        std.debug.assert(accessor.count == verticesView.len);
+
+                        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+                        switch (accessor.component_type) {
+                            .unsigned_byte => {
+                                var it = IndexedAccessorIterator(u8).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                                while (it.next()) |x| {
+                                    const j, const i = x;
+                                    verticesView[i].joints = .{
+                                        nodeBoneMap.get(skin.joints.items[j[0]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[1]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[2]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[3]]) orelse return error.InvalidJointIndex,
+                                    };
+                                }
+                            },
+                            .unsigned_short => {
+                                var it = IndexedAccessorIterator(u16).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                                while (it.next()) |x| {
+                                    const j, const i = x;
+                                    verticesView[i].joints = .{
+                                        nodeBoneMap.get(skin.joints.items[j[0]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[1]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[2]]) orelse return error.InvalidJointIndex,
+                                        nodeBoneMap.get(skin.joints.items[j[3]]) orelse return error.InvalidJointIndex,
+                                    };
+                                }
+                            },
+                            else => {
+                                std.debug.print("Invalid joint component type: {s}\n", .{@tagName(accessor.component_type)});
+                                return error.InvalidJointComponentType;
+                            }
+                        }
+                    },
+                    .weights => |idx| {
+                        const accessor = gltf.data.accessors.items[idx];
+
+                        std.debug.assert(accessor.count == verticesView.len);
+                        std.debug.assert(accessor.component_type == .float);
+
+                        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+                        var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                        while (it.next()) |x| {
+                            const w, const i = x;
+                            std.debug.assert(std.math.approxEqAbs(f32, w[0] + w[1] + w[2] + w[3], 1.0, std.math.floatEps(f32)));
+                            verticesView[i].weights = .{ w[0], w[1], w[2], w[3] };
+                        }
+                    },
+                    .texcoord => |idx| {
+                        const accessor = gltf.data.accessors.items[idx];
+
+                        std.debug.assert(accessor.count == verticesView.len);
+                        std.debug.assert(accessor.component_type == .float);
+
+                        const bufferView = gltf.data.buffer_views.items[accessor.buffer_view.?];
+
+                        var it = IndexedAccessorIterator(f32).init(&gltf, accessor, bufferMap[bufferView.buffer]);
+                        while (it.next()) |x| {
+                            const t, const i = x;
+                            verticesView[i].texcoord = .{ t[0], t[1] };
+                        }
+                    },
+                    else => {
+                        std.debug.print("Unhandled attribute: {}\n", .{attribute});
+                    },
+                }
+            }
+
+            if (!haveNormals) {
+                std.debug.print("Note: Mesh file does not contain normals, computing them instead", .{});
+                computeNormals(verticesView, indicesView, indexOffset);
+            }
         }
     }
 
@@ -623,8 +687,12 @@ pub fn main() !void {
 
 
     // load animation data //
-    const glAnimation = gltf.data.animations.items[0];
-    std.debug.assert(gltf.data.animations.items.len == 1);
+    const glAnimation = gltf.data.animations.items[ANIMATION_INDEX];
+
+    if (gltf.data.animations.items.len != 1) {
+        std.debug.print("NOTE: Only animation {} (of {}) will be loaded\n", .{ANIMATION_INDEX, gltf.data.animations.items.len});
+    }
+
 
     var animation = Animation {};
     defer animation.deinit(allocator);
@@ -865,7 +933,7 @@ pub fn main() !void {
     };
 
     const meshShaderProgram = zgl.createProgram();
-    meshShaderProgram.attach(skinVertexShader);
+    meshShaderProgram.attach(switch (MESH_VERTEX) { .basic => basicVertexShader, .skin => skinVertexShader });
     meshShaderProgram.attach(switch (MESH_FRAGMENT) { .visualize_weights => skinFragmentShader, .basic => basicFragmentShader, .lit => litFragmentShader });
     meshShaderProgram.link();
     defer meshShaderProgram.delete();
@@ -883,7 +951,7 @@ pub fn main() !void {
         .model = meshShaderProgram.uniformLocation("model") orelse return error.MissingUniform,
         .view = meshShaderProgram.uniformLocation("view") orelse return error.MissingUniform,
         .projection = meshShaderProgram.uniformLocation("projection") orelse return error.MissingUniform,
-        .skinMatrices = meshShaderProgram.uniformLocation("skinMatrices") orelse return error.MissingUniform,
+        .skinMatrices = meshShaderProgram.uniformLocation("skinMatrices"),
         .color = meshShaderProgram.uniformLocation("color"),
         .lightDir = meshShaderProgram.uniformLocation("lightDir"),
     };
@@ -898,7 +966,7 @@ pub fn main() !void {
 
         const ebo = zgl.createBuffer();
         meshVao.elementBuffer(ebo);
-        ebo.data(u16, indices.items, .static_draw);
+        ebo.data(Index, indices.items, .static_draw);
 
         const aPosLoc = zgl.getAttribLocation(meshShaderProgram, "aPos") orelse return error.MissingAttribute;
         meshVao.attribFormat(aPosLoc, componentCount(Vertex.Pos), nativeToGlType(componentType(Vertex.Pos)), true, @offsetOf(Vertex, "pos"));
@@ -910,18 +978,24 @@ pub fn main() !void {
             meshVao.attribBinding(aNormalLoc, 0);
             meshVao.enableVertexAttribute(aNormalLoc);
         } else {
-            std.debug.print("Note: no aNormal attribute in shader program; skipping", .{});
+            std.debug.print("Note: no aNormal attribute in shader program; skipping\n", .{});
         }
 
-        const aWeightsLoc = zgl.getAttribLocation(meshShaderProgram, "aWeights") orelse return error.MissingAttribute;
-        meshVao.attribFormat(aWeightsLoc, componentCount(Vertex.Weights), nativeToGlType(componentType(Vertex.Weights)), true, @offsetOf(Vertex, "weights"));
-        meshVao.attribBinding(aWeightsLoc, 0);
-        meshVao.enableVertexAttribute(aWeightsLoc);
+        if (zgl.getAttribLocation(meshShaderProgram, "aWeights")) |aWeightsLoc| {
+            meshVao.attribFormat(aWeightsLoc, componentCount(Vertex.Weights), nativeToGlType(componentType(Vertex.Weights)), true, @offsetOf(Vertex, "weights"));
+            meshVao.attribBinding(aWeightsLoc, 0);
+            meshVao.enableVertexAttribute(aWeightsLoc);
+        } else {
+            std.debug.print("Note: no aWeights attribute in shader program; skipping\n", .{});
+        }
 
-        const aJointsLoc = zgl.getAttribLocation(meshShaderProgram, "aJoints") orelse return error.MissingAttribute;
-        meshVao.attribIFormat(aJointsLoc, componentCount(Vertex.Joints), nativeToGlType(componentType(Vertex.Joints)), @offsetOf(Vertex, "joints"));
-        meshVao.attribBinding(aJointsLoc, 0);
-        meshVao.enableVertexAttribute(aJointsLoc);
+        if (zgl.getAttribLocation(meshShaderProgram, "aJoints")) |aJointsLoc| {
+            meshVao.attribIFormat(aJointsLoc, componentCount(Vertex.Joints), nativeToGlType(componentType(Vertex.Joints)), @offsetOf(Vertex, "joints"));
+            meshVao.attribBinding(aJointsLoc, 0);
+            meshVao.enableVertexAttribute(aJointsLoc);
+        } else {
+            std.debug.print("Note: no aJoints attribute in shader program; skipping\n", .{});
+        }
     }
 
 
@@ -955,7 +1029,7 @@ pub fn main() !void {
     const matrices = .{
         .model = zmath.identity(),
         .view = VIEWS[@intFromEnum(EXAMPLE)],
-        .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, 100.0),
+        .projection = zmath.perspectiveFovLhGl(0.25 * math.pi, ASPECT_RATIO, 0.1, CLIP_PLANES[@intFromEnum(EXAMPLE)]),
     };
 
 
@@ -969,7 +1043,7 @@ pub fn main() !void {
     meshShaderProgram.uniformMatrix4(meshUniforms.model, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.model)))[0..1]);
     meshShaderProgram.uniformMatrix4(meshUniforms.view, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.view)))[0..1]);
     meshShaderProgram.uniformMatrix4(meshUniforms.projection, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(&matrices.projection)))[0..1]);
-    meshShaderProgram.uniformMatrix4(meshUniforms.skinMatrices, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(skinMatrices.items)))[0..skinMatrices.items.len]);
+    if (meshUniforms.skinMatrices) |loc| meshShaderProgram.uniformMatrix4(loc, false, @as([*]const Mat4Arr, @ptrCast(zmath.arrNPtr(skinMatrices.items)))[0..skinMatrices.items.len]);
     if (meshUniforms.color) |loc| meshShaderProgram.uniform3f(loc, COLOR[0], COLOR[1], COLOR[2]);
     if (meshUniforms.lightDir) |loc| {
         const lightDir = LIGHT_DIRS[@intFromEnum(EXAMPLE)];
@@ -1014,13 +1088,13 @@ pub fn main() !void {
         skinMatrices.clearRetainingCapacity();
         try animation.generateBoneMatrices(&skeleton, &skinMatrices, zmath.identity(), 0, runTime);
         // std.debug.print("transferring skin matrices: {any}\n", .{skinMatrices.items});
-        meshShaderProgram.uniformMatrix4(meshUniforms.skinMatrices, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(skinMatrices.items.ptr)))[0..skinMatrices.items.len]);
+        if (meshUniforms.skinMatrices) |loc| meshShaderProgram.uniformMatrix4(loc, false, @as([*]const [4][4]f32, @ptrCast(zmath.arrNPtr(skinMatrices.items.ptr)))[0..skinMatrices.items.len]);
 
         zgl.clear(.{ .color = true, .depth = true });
 
         meshShaderProgram.use();
         meshVao.bind();
-        zgl.drawElements(.triangles, indices.items.len, .unsigned_short, 0);
+        zgl.drawElements(.triangles, indices.items.len, nativeToGlElementType(Index), 0);
 
         if (RENDER_BONE_POSITIONS) {
             basicShaderProgram.use();
@@ -1132,6 +1206,15 @@ fn nativeToGlType (comptime T: type) zgl.Type {
         u16 => .unsigned_short,
         u32 => .unsigned_int,
         else => @compileError("Unsupported type `" ++ @typeName(T) ++ "`"),
+    };
+}
+
+fn nativeToGlElementType (comptime T: type) zgl.ElementType {
+    return switch (T) {
+        u8 => .unsigned_byte,
+        u16 => .unsigned_short,
+        u32 => .unsigned_int,
+        else => @compileError("Unsupported element type `" ++ @typeName(T) ++ "`"),
     };
 }
 
